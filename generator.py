@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+import platform
 import sentencepiece as spm
 from sentencepiece import SentencePieceProcessor
 import gguf
@@ -158,7 +159,7 @@ class LlamaModel(nn.Module):
         self.blocks = nn.ModuleList([LlamaBlock(cfg) for _ in range(cfg.n_layer)])
         self.norm = RMSNorm(cfg.n_embd, eps=cfg.rms_eps)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)  # NOT tied
-        # weight tying (опционально можно включить): self.lm_head.weight = self.tok_emb.weight
+        # weight tying (optional): self.lm_head.weight = self.tok_emb.weight
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -176,10 +177,11 @@ class LlamaModel(nn.Module):
 # ----------------------------
 # Tokenizer / Dataset  (BPE via SentencePiece)
 # ----------------------------
+
 def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
     """
-    Тренируем SentencePiece в режиме BPE (а не Unigram).
-    Это даст стабильный BPE-токенайзер с byte_fallback и нашими спец-символами.
+    Train SentencePiece in BPE mode for a raw corpus (no chat symbols).
+    We keep only UNK/BOS/EOS. No user_defined_symbols.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = out_dir / "tokenizer"
@@ -188,7 +190,7 @@ def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
         input=str(corpus),
         model_prefix=str(prefix),
         vocab_size=vocab_size,
-        model_type="bpe",  # BPE вместо Unigram
+        model_type="bpe",  # BPE (not Unigram)
         character_coverage=1.0,
         bos_id=1,
         eos_id=2,
@@ -196,7 +198,6 @@ def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
         pad_id=-1,
         byte_fallback=True,
         normalization_rule_name="nmt_nfkc_cf",
-        user_defined_symbols="<|eot_id|>,<|im_start|>,<|im_end|>"
     )
     return prefix.with_suffix(".model")
 
@@ -222,6 +223,7 @@ class TextDataset(Dataset):
 # ----------------------------
 # GGUF export (official)
 # ----------------------------
+
 def _size_label(n: int) -> str:
     if n >= 1_000_000_000:
         v = n / 1e9; s = "B"
@@ -285,7 +287,7 @@ def export_to_gguf(model: LlamaModel, cfg: LlamaConfig, spm_path: Path, out_path
     writer.add_tokenizer_model("llama")        # SPM-family
     writer.add_tokenizer_pre("default")
     writer.add_token_list(tokens)
-    # Некоторые клиенты ожидают scores; положим нули (чистый Python list)
+    # Some clients expect scores; provide zeros.
     if hasattr(writer, "add_token_scores"):
         writer.add_token_scores([0.0] * len(tokens))
 
@@ -293,50 +295,9 @@ def export_to_gguf(model: LlamaModel, cfg: LlamaConfig, spm_path: Path, out_path
     writer.add_eos_token_id(int(_eos if _eos >= 0 else 2))
     writer.add_unk_token_id(int(_unk if _unk >= 0 else 0))
 
-    # IDs для служебных токенов
-    eot_id    = sp.piece_to_id("<|eot_id|>")
-    im_end_id = sp.piece_to_id("<|im_end|>")
-    if eot_id < 0:
-        eot_id = _eos
-
-    writer.add_uint32("llama.vocab_size", n_sp)
-
-    # Стоп-токены — для корректной остановки в LM Studio/клиентах
-    stop_ids = [int(x) for x in {eot_id, _eos, im_end_id} if x is not None and int(x) >= 0]
+    # Stop tokens: EOS only (raw corpus, no chat template)
+    stop_ids = [int(_eos)]
     _add_u32_list(writer, "tokenizer.ggml.stop_token_ids", stop_ids)
-    try:
-        _add_u32_list(writer, "tokenizer.ggml.chat_eos_token_ids", stop_ids)
-    except Exception:
-        pass
-
-    # Добавим EOT id (поддержка разных версий gguf)
-    try:
-        writer.add_eot_token_id(int(eot_id))
-    except AttributeError:
-        writer.add_uint32("tokenizer.ggml.eot_token_id", int(eot_id))
-
-    # Совместимый «средний» chat_template (без нестандартных директив вроде {% do %})
-    chat_tpl = """{% set bos = '<s>' -%}
-{% set im_start = '<|im_start|>' -%}
-{% set im_end = '<|im_end|>' -%}
-{{ bos }}{%- for m in messages -%}
-{%- if m['role'] == 'system' -%}
-{{ im_start }}system
-{{ m['content'] | trim }}{{ im_end }}
-{%- elif m['role'] == 'user' -%}
-{{ im_start }}user
-{{ m['content'] | trim }}{{ im_end }}
-{%- elif m['role'] == 'assistant' -%}
-{{ im_start }}assistant
-{{ m.get('content','') | trim }}{{ im_end }}
-{%- elif m['role'] == 'tool' -%}
-{{ im_start }}tool
-{{ m.get('content','') | trim }}{{ im_end }}
-{%- endif -%}
-{%- endfor -%}
-{{ im_start }}assistant
-"""
-    writer.add_string("tokenizer.chat_template", chat_tpl)
 
     # FILE TYPE ↔ DTYPE
     out_dtype = "float16" if cfg.dtype == "float16" else "float32"
@@ -382,6 +343,7 @@ def export_to_gguf(model: LlamaModel, cfg: LlamaConfig, spm_path: Path, out_path
 # ----------------------------
 # Post-export quantization (llama.cpp)
 # ----------------------------
+
 def _find_llama_quantize(custom_path: str | None = None) -> str | None:
     exe = "llama-quantize.exe" if os.name == "nt" else "llama-quantize"
     cands = []
@@ -431,6 +393,7 @@ def quantize_gguf(in_gguf: str, qtype: str = "Q3_K_L",
 # ----------------------------
 # Train loop
 # ----------------------------
+
 def train_once(run_name: str, data_path: str, models_dir: str,
                vocab_size: int, block_size: int,
                n_layer: int, n_head: int, n_embd: int,
@@ -440,7 +403,8 @@ def train_once(run_name: str, data_path: str, models_dir: str,
                quant: str | None = None,
                quant_bin: str | None = None,
                kv_heads: int | None = None,
-               keep_fp16: bool = True) -> str:
+               keep_fp16: bool = True,
+               workers: int | None = None) -> str:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if progress_cb:
         progress_cb(json.dumps({
@@ -464,7 +428,7 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     sp = SentencePieceProcessor(model_file=str(spm_path))
     n_sp = sp.vocab_size()
 
-    # 2) Encode corpus (каждый абзац -> BOS ... EOS)
+    # 2) Encode corpus (each paragraph -> BOS ... EOS)
     text = corpus.read_text(encoding="utf-8", errors="ignore")
     paragraphs = [p.strip() for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
 
@@ -487,30 +451,41 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     train_ds = TextDataset(train_ids.tolist(), block_size)
     val_ds = TextDataset(val_ids.tolist(), block_size)
 
-    # >>> DataLoader: big dataset settings
+    # DataLoader (large dataset settings)
+    # pick safe DataLoader defaults for Windows (worker=0 avoids win32 multiprocessing quirks)
+    workers = 0 if os.name == "nt" else 2
+    _common_loader_kwargs = dict(
+        pin_memory=True,
+        drop_last=True,
+        num_workers=workers,
+    )
+
+    # DataLoader (defaults: workers=2 like before; override via --workers)
+    _workers = 2 if workers is None else int(workers)
+    _common_loader_kwargs = dict(
+        pin_memory=True,
+        drop_last=True,
+        num_workers=_workers,
+    )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
-        drop_last=True,
-        pin_memory=True,
-        num_workers=2,
-        persistent_workers=True,
-        prefetch_factor=2,
+        **_common_loader_kwargs,
+        **({"persistent_workers": True, "prefetch_factor": 2} if _workers > 0 else {})
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        drop_last=True,
-        pin_memory=True,
-        num_workers=2,
-        persistent_workers=True,
-        prefetch_factor=2,
+        **_common_loader_kwargs,
+        **({"persistent_workers": True, "prefetch_factor": 2} if _workers > 0 else {})
     )
-    # <<<
+
 
     # 3) Model
+
     cfg = LlamaConfig(
         vocab_size=n_sp,
         n_layer=n_layer,
@@ -520,7 +495,7 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     )
     model = LlamaModel(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and amp))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda" and amp))
 
     # log params once
     total_params = sum(p.numel() for p in model.parameters())
@@ -541,7 +516,7 @@ def train_once(run_name: str, data_path: str, models_dir: str,
             t0 = time.time()
             xb = xb.to(device); yb = yb.to(device)
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+            with torch.amp.autocast("cuda", enabled=scaler.is_enabled()):
                 _, loss = model(xb, yb)
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -573,10 +548,10 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_file = models_dir / f"{run_name}-{stamp}.gguf"
 
-    # 4) Export GGUF (всё внутри .gguf)
+    # 4) Export GGUF (everything inside .gguf)
     saved = export_to_gguf(model, cfg, spm_path, out_file, run_name=run_name)
 
-    # (опционально) оставить .tokenizer.model рядом — повысит переносимость для некоторых клиентов
+    # (optional) also drop .tokenizer.model nearby — helps some clients
     try:
         shutil.copy2(spm_path, out_file.with_suffix(".tokenizer.model"))
     except Exception:
@@ -604,6 +579,7 @@ def train_once(run_name: str, data_path: str, models_dir: str,
 # ----------------------------
 # CLI
 # ----------------------------
+
 def cli_main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=str, default="run")
@@ -618,6 +594,7 @@ def cli_main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--workers", type=int, default=None, help="DataLoader workers (override; default 0 on Windows, 2 otherwise)")
     ap.add_argument("--dtype", type=str, default="float16", choices=["float16", "float32", "bfloat16"])
     ap.add_argument("--quant", type=str, default=None, help="e.g. Q3_K_L, Q4_K_M, Q5_K_S, Q8_0, IQ4_NL ...")
     ap.add_argument("--quant-bin", type=str, default=None, help="path to llama-quantize if not in PATH")
@@ -636,7 +613,8 @@ def cli_main():
         lr=args.lr, batch_size=args.batch, epochs=args.epochs,
         weight_dtype=dtype, amp=True, progress_cb=_print,
         quant=args.quant, quant_bin=args.quant_bin, kv_heads=args.kv_heads,
-        keep_fp16=(not args.no_keep_fp16)
+        keep_fp16=(not args.no_keep_fp16),
+        workers=args.workers
     )
 
 
