@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # PyAiModel-TFormer-BPERoPESwiGLU — generator.py
-# Train LLaMA-style Transformer (RMSNorm + RoPE + SwiGLU, no bias) with SentencePiece
+# Train LLaMA-style Transformer (RMSNorm + RoPE + SwiGLU, no bias) with SentencePiece (BPE mode)
 # and export a fully compliant GGUF v3 using the official `gguf` library.
 # Plus optional post-export quantization via llama.cpp's llama-quantize.
 # Author: Artur Strazewicz — 2025 — MIT
@@ -144,28 +144,35 @@ class LlamaModel(nn.Module):
         return logits, loss
 
 # ----------------------------
-# Tokenizer / Dataset
+# Tokenizer / Dataset  (BPE via SentencePiece)
 # ----------------------------
-def train_sentencepiece(corpus: Path, out_dir: Path, vocab_size: int):
+def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
+    """
+    Тренируем SentencePiece в режиме BPE (а не Unigram).
+    Это даст стабильный BPE-токенайзер с byte_fallback и нашими спец-символами.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = out_dir / "tokenizer"
+
     spm.SentencePieceTrainer.Train(
         input=str(corpus),
         model_prefix=str(prefix),
         vocab_size=vocab_size,
-        model_type="unigram",
+        model_type="bpe",               # ключевая смена: BPE вместо Unigram
         character_coverage=1.0,
         bos_id=1,
         eos_id=2,
         unk_id=0,
         pad_id=-1,
-        byte_fallback=True,
+        byte_fallback=True,             # байтовый фолбэк оставил включенным
         normalization_rule_name="nmt_nfkc_cf",
+        user_defined_symbols="<|eot_id|>,<|im_start|>,<|im_end|>"
     )
     return prefix.with_suffix(".model")
 
 def encode_spm(sp: SentencePieceProcessor, text: str):
-    ids = [sp.bos_id()] + sp.encode(text) + [sp.eos_id()]
+    # API SentencePiece: sp.encode(text, out_type=int) вернёт ids
+    ids = [sp.bos_id()] + sp.encode(text, out_type=int) + [sp.eos_id()]
     return ids
 
 class TextDataset(Dataset):
@@ -225,19 +232,32 @@ def export_to_gguf(model: LlamaModel, cfg: LlamaConfig, spm_path: Path, out_path
     n_sp = sp.vocab_size()
     assert cfg.vocab_size == n_sp, f"vocab mismatch: cfg={cfg.vocab_size} vs spm={n_sp}"
 
+    _bos = sp.bos_id()
+    _eos = sp.eos_id()
+    _unk = sp.unk_id()
+
     tokens = [sp.id_to_piece(i) for i in range(n_sp)]
-    writer.add_tokenizer_model("llama")   # important: SPM/unigram is "llama"
+    # Мы всё ещё используем SentencePiece-контейнер, просто в режиме BPE:
+    writer.add_tokenizer_model("llama")   # указывает на SPM (тип — внутри .model = BPE)
     writer.add_tokenizer_pre("default")
     writer.add_token_list(tokens)
 
-    _bos = sp.bos_id();  _eos = sp.eos_id();  _unk = sp.unk_id()
     writer.add_bos_token_id(_bos if _bos >= 0 else 1)
     writer.add_eos_token_id(_eos if _eos >= 0 else 2)
     writer.add_unk_token_id(_unk if _unk >= 0 else 0)
 
+    # EOT — если нет, фолбэк на EOS
+    eot_id = sp.piece_to_id("<|eot_id|>")
+    if eot_id < 0:
+        eot_id = _eos
+    try:
+        writer.add_eot_token_id(int(eot_id))
+    except AttributeError:
+        writer.add_uint32("tokenizer.ggml.eot_token_id", int(eot_id))
+
     writer.add_uint32("llama.vocab_size", n_sp)
 
-    # FILE TYPE ↔ DTYPE (do not mutate cfg)
+    # FILE TYPE ↔ DTYPE
     out_dtype = "float16" if cfg.dtype == "float16" else "float32"
     writer.add_uint32("general.file_type", 1 if out_dtype == "float16" else 0)
 
@@ -255,21 +275,21 @@ def export_to_gguf(model: LlamaModel, cfg: LlamaConfig, spm_path: Path, out_path
 
     # Embeddings / output
     add("token_embd.weight", sd["tok_emb.weight"])
-    add("output_norm.weight", sd["norm.weight"], force_f32=True)  # <-- FP32
+    add("output_norm.weight", sd["norm.weight"], force_f32=True)  # FP32 norms
     add("output.weight", sd["lm_head.weight"])
 
     # Blocks
     for i in range(cfg.n_layer):
         p = f"blocks.{i}."
-        add(f"blk.{i}.attn_norm.weight", sd[p + "attn_norm.weight"], force_f32=True)  # <-- FP32
-        add(f"blk.{i}.attn_q.weight", sd[p + "attn.q_proj.weight"])
-        add(f"blk.{i}.attn_k.weight", sd[p + "attn.k_proj.weight"])
-        add(f"blk.{i}.attn_v.weight", sd[p + "attn.v_proj.weight"])
-        add(f"blk.{i}.attn_output.weight", sd[p + "attn.o_proj.weight"])
-        add(f"blk.{i}.ffn_norm.weight", sd[p + "ffn_norm.weight"], force_f32=True)  # <-- FP32
-        add(f"blk.{i}.ffn_gate.weight", sd[p + "mlp.gate_proj.weight"])
-        add(f"blk.{i}.ffn_up.weight", sd[p + "mlp.up_proj.weight"])
-        add(f"blk.{i}.ffn_down.weight", sd[p + "mlp.down_proj.weight"])
+        add(f"blk.{i}.attn_norm.weight", sd[p + "attn_norm.weight"], force_f32=True)
+        add(f"blk.{i}.attn_q.weight",     sd[p + "attn.q_proj.weight"])
+        add(f"blk.{i}.attn_k.weight",     sd[p + "attn.k_proj.weight"])
+        add(f"blk.{i}.attn_v.weight",     sd[p + "attn.v_proj.weight"])
+        add(f"blk.{i}.attn_output.weight",sd[p + "attn.o_proj.weight"])
+        add(f"blk.{i}.ffn_norm.weight",   sd[p + "ffn_norm.weight"], force_f32=True)
+        add(f"blk.{i}.ffn_gate.weight",   sd[p + "mlp.gate_proj.weight"])
+        add(f"blk.{i}.ffn_up.weight",     sd[p + "mlp.up_proj.weight"])
+        add(f"blk.{i}.ffn_down.weight",   sd[p + "mlp.down_proj.weight"])
 
     # Write file
     writer.write_header_to_file()
@@ -351,30 +371,25 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     corpus = Path(data_path)
     assert corpus.is_file(), f"Missing {data_path}"
 
-    # 1) SentencePiece (train tokenizer for requested vocab_size)
+    # 1) SentencePiece (BPE) — train tokenizer for requested vocab_size
     run_dir = models_dir / run_name
     if run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    spm_path = train_sentencepiece(corpus, run_dir, vocab_size)
+    spm_path = train_sentencepiece_bpe(corpus, run_dir, vocab_size)
     sp = SentencePieceProcessor(model_file=str(spm_path))
     n_sp = sp.vocab_size()
 
     # 2) Encode corpus  (каждый абзац -> отдельный сэмпл с BOS/EOS)
     text = corpus.read_text(encoding="utf-8", errors="ignore")
-
-    # нормализуем перевод строки, режем по пустой строке (абзацы)
     paragraphs = [p.strip() for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
 
     ids_list: list[int] = []
     for ex in paragraphs:
-        # для очень длинных абзацев можно слегка «почистить» пробелы
-        # ex = " ".join(ex.split())
         ids_list.extend([sp.bos_id()])
-        ids_list.extend(sp.encode(ex))
+        ids_list.extend(sp.encode(ex, out_type=int))
         ids_list.extend([sp.eos_id()])
 
-    # fallback на случай совсем пустого датасета
     if not ids_list:
         ids_list = [sp.bos_id(), sp.eos_id()]
 
