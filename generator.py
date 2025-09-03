@@ -360,10 +360,25 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     sp = SentencePieceProcessor(model_file=str(spm_path))
     n_sp = sp.vocab_size()
 
-    # 2) Encode corpus
+    # 2) Encode corpus  (каждый абзац -> отдельный сэмпл с BOS/EOS)
     text = corpus.read_text(encoding="utf-8", errors="ignore")
-    ids = encode_spm(sp, text)
-    ids = torch.tensor(ids, dtype=torch.long)
+
+    # нормализуем перевод строки, режем по пустой строке (абзацы)
+    paragraphs = [p.strip() for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
+
+    ids_list: list[int] = []
+    for ex in paragraphs:
+        # для очень длинных абзацев можно слегка «почистить» пробелы
+        # ex = " ".join(ex.split())
+        ids_list.extend([sp.bos_id()])
+        ids_list.extend(sp.encode(ex))
+        ids_list.extend([sp.eos_id()])
+
+    # fallback на случай совсем пустого датасета
+    if not ids_list:
+        ids_list = [sp.bos_id(), sp.eos_id()]
+
+    ids = torch.tensor(ids_list, dtype=torch.long)
 
     # split
     val_split = 0.01
