@@ -179,10 +179,6 @@ class LlamaModel(nn.Module):
 # ----------------------------
 
 def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
-    """
-    Train SentencePiece in BPE mode for a raw corpus (no chat symbols).
-    We keep only UNK/BOS/EOS. No user_defined_symbols.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = out_dir / "tokenizer"
 
@@ -190,7 +186,7 @@ def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
         input=str(corpus),
         model_prefix=str(prefix),
         vocab_size=vocab_size,
-        model_type="bpe",  # BPE (not Unigram)
+        model_type="bpe",
         character_coverage=1.0,
         bos_id=1,
         eos_id=2,
@@ -198,6 +194,7 @@ def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
         pad_id=-1,
         byte_fallback=True,
         normalization_rule_name="nmt_nfkc_cf",
+        user_defined_symbols=["\n", "\n\n", "\t"],  # Сохраняем переносы строк и табуляцию
     )
     return prefix.with_suffix(".model")
 
@@ -296,7 +293,23 @@ def export_to_gguf(model: LlamaModel, cfg: LlamaConfig, spm_path: Path, out_path
     writer.add_unk_token_id(int(_unk if _unk >= 0 else 0))
 
     # Stop tokens: EOS only (raw corpus, no chat template)
-    stop_ids = [int(_eos)]
+    # Собираем набор желаемых стоп-писов (одиночные токены!)
+    stop_pieces = []
+    stop_pieces.append(sp.id_to_piece(_eos))  # всегда EOS
+    for p in ["\n\n", "<|im_end|>", "<|stop|>"]:
+        tid = sp.piece_to_id(p)
+        if tid >= 0:
+            stop_pieces.append(p)
+
+    # Мапим pieces -> ids, фильтруем дубликаты
+    stop_ids = []
+    seen = set()
+    for p in stop_pieces:
+        tid = sp.piece_to_id(p) if isinstance(p, str) else int(p)
+        if tid is not None and tid >= 0 and tid not in seen:
+            stop_ids.append(int(tid))
+            seen.add(tid)
+
     _add_u32_list(writer, "tokenizer.ggml.stop_token_ids", stop_ids)
 
     # FILE TYPE ↔ DTYPE
@@ -429,7 +442,7 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     n_sp = sp.vocab_size()
 
     # 2) Encode corpus (each paragraph -> BOS ... EOS)
-    text = corpus.read_text(encoding="utf-8", errors="ignore")
+    text = corpus.read_text(encoding="utf-8", errors="ignore").replace("\r\n", "\n")
     paragraphs = [p.strip() for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
 
     ids_list: list[int] = []
