@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-# PyAiModel-TFormer-BPERoPESwiGLU — generator.py
-# Train LLaMA-style Transformer (RMSNorm + RoPE + SwiGLU, optional GQA) with SentencePiece (BPE mode)
-# and export a fully compliant GGUF v3 using the official `gguf` library.
-# Plus optional post-export quantization via llama.cpp's llama-quantize.
-# Author: Artur Strazewicz — 2025 — MIT
+# -*- coding: utf-8 -*-
+"""
+PyAiModel-TFormer-BPERoPESwiGLU — generator.py
+Train LLaMA-style Transformer (RMSNorm + RoPE + SwiGLU, optional GQA) with SentencePiece (BPE mode)
+and export a fully compliant GGUF v3 using the official `gguf` library.
+Supports:
+- LM training on plain .txt
+- SFT training on JSONL {system,prompt,response}
+Author: Artur Strazewicz — 2025 — MIT
+"""
 
-import argparse, json, os, math, time, shutil, subprocess
+import argparse, json, os, math, time, shutil, subprocess, io
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,13 +35,13 @@ class LlamaConfig:
     vocab_size: int
     n_layer: int = 8
     n_head: int = 8
-    n_kv_head: int = 8  # GQA: number of KV heads (<= n_head). If == n_head, it's MHA.
+    n_kv_head: int = 8
     n_embd: int = 512
     block_size: int = 512
     dropout: float = 0.0
     rope_theta: float = 10000.0
     rms_eps: float = 1e-5
-    dtype: str = "float16"  # export dtype: float16|float32 (bfloat16 -> cast to f32)
+    dtype: str = "float16"  # export dtype
 
 
 def _head_dim(cfg: LlamaConfig) -> int:
@@ -82,35 +87,31 @@ class LlamaAttention(nn.Module):
         d = cfg.n_embd
         self.n_head = cfg.n_head
         self.n_kv = cfg.n_kv_head
-        assert self.n_head % self.n_kv == 0, "n_head must be divisible by n_kv_head for GQA"
+        assert self.n_head % self.n_kv == 0
         self.groups = self.n_head // self.n_kv
         self.head_dim = d // cfg.n_head
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
-        # Q produces n_head * head_dim
         self.q_proj = nn.Linear(d, d, bias=False)
-        # K,V produce n_kv * head_dim (GQA)
         self.k_proj = nn.Linear(d, self.n_kv * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d, self.n_kv * self.head_dim, bias=False)
-
         self.o_proj = nn.Linear(d, d, bias=False)
         self.drop = nn.Dropout(cfg.dropout)
         self.rope = RoPE(self.head_dim, base=cfg.rope_theta)
 
     def forward(self, x):
         B, T, C = x.shape
-        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)   # [B,h,T,hd]
-        k = self.k_proj(x).view(B, T, self.n_kv,  self.head_dim).transpose(1, 2)    # [B,kv,T,hd]
-        v = self.v_proj(x).view(B, T, self.n_kv,  self.head_dim).transpose(1, 2)    # [B,kv,T,hd]
+        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
 
         cos, sin = self.rope.cos_sin(T, x.device)
         q = RoPE.apply(q, cos, sin)
         k = RoPE.apply(k, cos, sin)
 
         if self.groups > 1:
-            # replicate K/V across groups to match n_head
-            k = k.repeat_interleave(self.groups, dim=1)  # [B,h,T,hd]
-            v = v.repeat_interleave(self.groups, dim=1)  # [B,h,T,hd]
+            k = k.repeat_interleave(self.groups, dim=1)
+            v = v.repeat_interleave(self.groups, dim=1)
 
         att = (q @ k.transpose(-2, -1)) * self.scale
         mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool)).view(1, 1, T, T)
@@ -127,7 +128,7 @@ class LlamaMLP(nn.Module):
     def __init__(self, cfg: LlamaConfig):
         super().__init__()
         d = cfg.n_embd
-        hidden = int(4 * d * 2 // 3)  # SwiGLU sizing
+        hidden = int(4 * d * 2 // 3)
         self.gate_proj = nn.Linear(d, hidden, bias=False)
         self.up_proj = nn.Linear(d, hidden, bias=False)
         self.down_proj = nn.Linear(hidden, d, bias=False)
@@ -158,8 +159,7 @@ class LlamaModel(nn.Module):
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.blocks = nn.ModuleList([LlamaBlock(cfg) for _ in range(cfg.n_layer)])
         self.norm = RMSNorm(cfg.n_embd, eps=cfg.rms_eps)
-        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)  # NOT tied
-        # weight tying (optional): self.lm_head.weight = self.tok_emb.weight
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -175,7 +175,7 @@ class LlamaModel(nn.Module):
 
 
 # ----------------------------
-# Tokenizer / Dataset  (BPE via SentencePiece)
+# Tokenizer / Dataset
 # ----------------------------
 
 def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
@@ -194,7 +194,6 @@ def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
         pad_id=-1,
         byte_fallback=True,
         normalization_rule_name="nmt_nfkc_cf",
-        user_defined_symbols=["\n", "\n\n", "\t"],  # Сохраняем переносы строк и табуляцию
     )
     return prefix.with_suffix(".model")
 
@@ -215,6 +214,40 @@ class TextDataset(Dataset):
         x = torch.tensor(self.ids[i:i + self.block], dtype=torch.long)
         y = torch.tensor(self.ids[i + 1:i + self.block + 1], dtype=torch.long)
         return x, y
+
+
+# ----------------------------
+# JSONL → corpus (SFT)
+# ----------------------------
+import io
+import json
+
+def _format_sft_example(system: str | None, prompt: str, response: str) -> str:
+    sys_part = f"<|system|>\n{system.strip()}\n" if (system and system.strip()) else ""
+    return (
+        f"{sys_part}"
+        f"<|user|>\n{prompt.strip()}\n"
+        f"<|assistant|>\n{response.strip()}\n"
+        f"</s>\n"
+    )
+
+
+def load_jsonl_build_corpus(jsonl_path: Path) -> str:
+    buf = io.StringIO()
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            prompt = obj.get("prompt", "")
+            response = obj.get("response", "")
+            system = obj.get("system", None)
+            if not prompt or not response:
+                continue
+            buf.write(_format_sft_example(system, prompt, response))
+            buf.write("\n")
+    return buf.getvalue()
 
 
 # ----------------------------
@@ -292,24 +325,8 @@ def export_to_gguf(model: LlamaModel, cfg: LlamaConfig, spm_path: Path, out_path
     writer.add_eos_token_id(int(_eos if _eos >= 0 else 2))
     writer.add_unk_token_id(int(_unk if _unk >= 0 else 0))
 
-    # Stop tokens: EOS only (raw corpus, no chat template)
-    # Собираем набор желаемых стоп-писов (одиночные токены!)
-    stop_pieces = []
-    stop_pieces.append(sp.id_to_piece(_eos))  # всегда EOS
-    for p in ["\n\n", "<|im_end|>", "<|stop|>"]:
-        tid = sp.piece_to_id(p)
-        if tid >= 0:
-            stop_pieces.append(p)
-
-    # Мапим pieces -> ids, фильтруем дубликаты
-    stop_ids = []
-    seen = set()
-    for p in stop_pieces:
-        tid = sp.piece_to_id(p) if isinstance(p, str) else int(p)
-        if tid is not None and tid >= 0 and tid not in seen:
-            stop_ids.append(int(tid))
-            seen.add(tid)
-
+    # Stop tokens: EOS only (raw/SFT corpus, без спецчат-символов)
+    stop_ids = [int(_eos)]
     _add_u32_list(writer, "tokenizer.ggml.stop_token_ids", stop_ids)
 
     # FILE TYPE ↔ DTYPE
@@ -399,12 +416,12 @@ def quantize_gguf(in_gguf: str, qtype: str = "Q3_K_L",
 
     run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if run.returncode != 0:
-        raise RuntimeError(f"llama-quantize failed ({run.returncode}):\n{run.stdout}")
+        raise RuntimeError(f"llama-quantize failed ({run.returncode}): {run.stdout}")
     return out_gguf
 
 
 # ----------------------------
-# Train loop
+# Train loop (LM + SFT)
 # ----------------------------
 
 def train_once(run_name: str, data_path: str, models_dir: str,
@@ -417,32 +434,30 @@ def train_once(run_name: str, data_path: str, models_dir: str,
                quant_bin: str | None = None,
                kv_heads: int | None = None,
                keep_fp16: bool = True,
-               workers: int | None = None) -> str:
+               workers: int | None = None,
+               task: str = "lm",
+               data_jsonl: str | None = None) -> str:
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if progress_cb:
-        progress_cb(json.dumps({
-            "device": device,
-            "cuda_available": torch.cuda.is_available(),
-            "cuda_name0": (torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),
-            "torch": torch.__version__,
-        }))
 
     models_dir = Path(models_dir)
     models_dir.mkdir(parents=True, exist_ok=True)
     corpus = Path(data_path)
-    assert corpus.is_file(), f"Missing {data_path}"
 
-    # 1) SentencePiece (BPE)
     run_dir = models_dir / run_name
     if run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+
     spm_path = train_sentencepiece_bpe(corpus, run_dir, vocab_size)
     sp = SentencePieceProcessor(model_file=str(spm_path))
     n_sp = sp.vocab_size()
 
-    # 2) Encode corpus (each paragraph -> BOS ... EOS)
-    text = corpus.read_text(encoding="utf-8", errors="ignore").replace("\r\n", "\n")
+    if task == "sft":
+        src_jsonl = Path(data_jsonl) if data_jsonl else corpus
+        text = load_jsonl_build_corpus(src_jsonl)
+    else:
+        text = corpus.read_text(encoding="utf-8", errors="ignore")
+
     paragraphs = [p.strip() for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
 
     ids_list: list[int] = []
@@ -456,7 +471,6 @@ def train_once(run_name: str, data_path: str, models_dir: str,
 
     ids = torch.tensor(ids_list, dtype=torch.long)
 
-    # split
     val_split = 0.01
     n = len(ids)
     train_len = max(0, int(n * (1.0 - val_split)))
@@ -464,40 +478,10 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     train_ds = TextDataset(train_ids.tolist(), block_size)
     val_ds = TextDataset(val_ids.tolist(), block_size)
 
-    # DataLoader (large dataset settings)
-    # pick safe DataLoader defaults for Windows (worker=0 avoids win32 multiprocessing quirks)
-    workers = 0 if os.name == "nt" else 2
-    _common_loader_kwargs = dict(
-        pin_memory=True,
-        drop_last=True,
-        num_workers=workers,
-    )
-
-    # DataLoader (defaults: workers=2 like before; override via --workers)
-    _workers = 2 if workers is None else int(workers)
-    _common_loader_kwargs = dict(
-        pin_memory=True,
-        drop_last=True,
-        num_workers=_workers,
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        **_common_loader_kwargs,
-        **({"persistent_workers": True, "prefetch_factor": 2} if _workers > 0 else {})
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        **_common_loader_kwargs,
-        **({"persistent_workers": True, "prefetch_factor": 2} if _workers > 0 else {})
-    )
-
-
-    # 3) Model
+    workers = 0 if os.name == "nt" else 2 if workers is None else int(workers)
+    loader_kwargs = dict(pin_memory=True, drop_last=True, num_workers=workers)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     cfg = LlamaConfig(
         vocab_size=n_sp,
@@ -510,24 +494,15 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda" and amp))
 
-    # log params once
-    total_params = sum(p.numel() for p in model.parameters())
-    if progress_cb:
-        progress_cb(f"PARAMS {total_params} ({_size_label(total_params)}) | "
-                    f"d_model={cfg.n_embd}, heads={cfg.n_head}, kv_heads={cfg.n_kv_head}, "
-                    f"layers={cfg.n_layer}, ctx={cfg.block_size}, vocab={cfg.vocab_size}")
-        progress_cb(f"Training started (device={device}, AMP={scaler.is_enabled()})")
-
     total_steps = max(1, epochs * len(train_loader))
-    start = time.time()
     global_step = 0
+    start = time.time()
 
     for ep in range(epochs):
         model.train()
-        pbar = tqdm(train_loader, desc=f"epoch {ep + 1}/{epochs}")
+        pbar = tqdm(train_loader, desc=f"epoch {ep+1}/{epochs}")
         for xb, yb in pbar:
-            t0 = time.time()
-            xb = xb.to(device); yb = yb.to(device)
+            xb, yb = xb.to(device), yb.to(device)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=scaler.is_enabled()):
                 _, loss = model(xb, yb)
@@ -536,57 +511,29 @@ def train_once(run_name: str, data_path: str, models_dir: str,
             scaler.step(opt); scaler.update()
 
             global_step += 1
-            pct = 100.0 * global_step / total_steps
-            step_time = time.time() - t0
-            elapsed = (time.time() - start) / 60.0
-            eta = (elapsed / max(1e-9, pct / 100.0)) - elapsed if pct > 0 else 0.0
             if progress_cb:
-                progress_cb(
-                    f"Progress:  {pct:.2f}% | epoch {ep + 1}/{epochs} | step {global_step % len(train_loader)}/{len(train_loader)} | "
-                    f"loss {loss.item():.4f} | s_it {step_time:.2f}s/it | elapsed {elapsed:.2f}m | ETA {eta:.2f}m")
+                progress_cb(f"step {global_step}/{total_steps} loss={loss.item():.4f}")
 
-        # val
         model.eval()
         with torch.no_grad():
             vloss = []
             for xb, yb in val_loader:
-                xb = xb.to(device); yb = yb.to(device)
+                xb, yb = xb.to(device), yb.to(device)
                 _, vl = model(xb, yb)
                 vloss.append(vl.item())
-        if vloss and progress_cb:
-            mv = float(np.mean(vloss))
-            ppl = math.exp(min(20, mv))
-            progress_cb(f"Validation loss: {mv:.4f} | ppl: {ppl:.2f}")
+            if vloss and progress_cb:
+                mv = float(np.mean(vloss))
+                ppl = math.exp(min(20, mv))
+                progress_cb(f"Validation loss={mv:.4f} ppl={ppl:.2f}")
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_file = models_dir / f"{run_name}-{stamp}.gguf"
-
-    # 4) Export GGUF (everything inside .gguf)
     saved = export_to_gguf(model, cfg, spm_path, out_file, run_name=run_name)
 
-    # (optional) also drop .tokenizer.model nearby — helps some clients
-    try:
-        shutil.copy2(spm_path, out_file.with_suffix(".tokenizer.model"))
-    except Exception:
-        pass
-
-    # 5) Optional quantization
-    final_path = saved
+    # optional quant
     if quant:
-        if progress_cb: progress_cb(f"Quantizing to {quant} ...")
-        q_out = quantize_gguf(saved, qtype=quant, quant_bin=quant_bin)
-        final_path = q_out
-        if not keep_fp16:
-            try:
-                os.remove(saved)
-                if progress_cb: progress_cb(f"Removed FP16/FP32: {saved}")
-            except Exception as _e:
-                if progress_cb: progress_cb(f"WARN: cannot remove {saved}: {_e}")
-
-    if progress_cb:
-        progress_cb(f"Saved weights: {final_path}")
-        progress_cb("DONE")
-    return final_path
+        saved = quantize_gguf(saved, qtype=quant, quant_bin=quant_bin)
+    return saved
 
 
 # ----------------------------
@@ -597,37 +544,51 @@ def cli_main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=str, default="run")
     ap.add_argument("--data", type=str, default="Datasets/dataset.txt")
+    ap.add_argument("--data-jsonl", type=str, default=None)
     ap.add_argument("--models", type=str, default="Models")
+    ap.add_argument("--task", type=str, default="lm", choices=["lm", "sft"])
     ap.add_argument("--vocab", type=int, default=32000)
     ap.add_argument("--block", type=int, default=256)
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--heads", type=int, default=8)
-    ap.add_argument("--kv-heads", type=int, default=None, help="number of KV heads for GQA (<= n_head)")
+    ap.add_argument("--kv-heads", type=int, default=None)
     ap.add_argument("--embd", type=int, default=512)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=2)
-    ap.add_argument("--workers", type=int, default=None, help="DataLoader workers (override; default 0 on Windows, 2 otherwise)")
-    ap.add_argument("--dtype", type=str, default="float16", choices=["float16", "float32", "bfloat16"])
-    ap.add_argument("--quant", type=str, default=None, help="e.g. Q3_K_L, Q4_K_M, Q5_K_S, Q8_0, IQ4_NL ...")
-    ap.add_argument("--quant-bin", type=str, default=None, help="path to llama-quantize if not in PATH")
-    ap.add_argument("--no-keep-fp16", action="store_true", help="remove original FP16/FP32 after quantization")
+    ap.add_argument("--workers", type=int, default=None)
+    ap.add_argument("--dtype", type=str, default="float16",
+                    choices=["float16", "float32", "bfloat16"])
+    ap.add_argument("--quant", type=str, default=None)
+    ap.add_argument("--quant-bin", type=str, default=None)
+    ap.add_argument("--no-keep-fp16", action="store_true")
     args = ap.parse_args()
 
+    dtype = args.dtype if args.dtype in ("float16", "float32") else "float32"
     def _print(x): print(x, flush=True)
 
-    # Map bfloat16 -> float32 for GGUF export compatibility
-    dtype = args.dtype if args.dtype in ("float16", "float32") else "float32"
-
     train_once(
-        run_name=args.run, data_path=args.data, models_dir=args.models,
-        vocab_size=args.vocab, block_size=args.block,
-        n_layer=args.layers, n_head=args.heads, n_embd=args.embd,
-        lr=args.lr, batch_size=args.batch, epochs=args.epochs,
-        weight_dtype=dtype, amp=True, progress_cb=_print,
-        quant=args.quant, quant_bin=args.quant_bin, kv_heads=args.kv_heads,
+        run_name=args.run,
+        data_path=args.data,
+        models_dir=args.models,
+        vocab_size=args.vocab,
+        block_size=args.block,
+        n_layer=args.layers,
+        n_head=args.heads,
+        n_embd=args.embd,
+        lr=args.lr,
+        batch_size=args.batch,
+        epochs=args.epochs,
+        weight_dtype=dtype,
+        amp=True,
+        progress_cb=_print,
+        quant=args.quant,
+        quant_bin=args.quant_bin,
+        kv_heads=args.kv_heads,
         keep_fp16=(not args.no_keep_fp16),
-        workers=args.workers
+        workers=args.workers,
+        task=args.task,
+        data_jsonl=args.data_jsonl
     )
 
 
