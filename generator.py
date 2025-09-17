@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# PyAiModel-TFormer-BPERoPESwiGLU — generator.py (ChatML, BOTH default, auto JSONL)
+# PyAiModel-TFormer-BPERoPESwiGLU — generator.py (Llama 3 Instruct, BOTH default, auto JSONL)
 # Train LLaMA-style Transformer (RMSNorm + RoPE + SwiGLU, optional GQA) with SentencePiece (BPE mode)
 # and export a fully compliant GGUF v3 using the official `gguf` library.
-# Adds SFT with ChatML (<|im_start|>/<|im_end|>) and permissive tokenizer for Unicode/bytes.
+# Adds SFT with Llama 3 chat format (<|start_header_id|>/<|end_header_id|> ... <|eot_id|>) and permissive tokenizer for Unicode/bytes.
 # Default task: BOTH (LM + SFT) with auto JSONL discovery in Datasets/.
 # Author: Artur Strazewicz — 2025 — MIT
 
-import argparse, json, os, math, time, shutil, subprocess
+import argparse, json, os, math, time, shutil, subprocess, re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -150,7 +150,6 @@ class LlamaModel(nn.Module):
 # ----------------------------
 # Sanitize: удаление управляющих ASCII (кроме \n и \t)
 # ----------------------------
-import re
 _CLEAN_CC = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 
 def sanitize_text(s: str) -> str:
@@ -159,12 +158,14 @@ def sanitize_text(s: str) -> str:
         return ""
     return _CLEAN_CC.sub("", s)
 
-
 # ----------------------------
-# Tokenizer / Datasets
+# Tokenizer / Datasets — Llama 3 special tokens
 # ----------------------------
-CHATML_START = "<|im_start|>"
-CHATML_END   = "<|im_end|>"
+L3_BEGIN = "<|begin_of_text|>"
+L3_END   = "<|end_of_text|>"
+L3_S     = "<|start_header_id|>"
+L3_E     = "<|end_header_id|>"
+L3_EOT   = "<|eot_id|>"
 
 def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -181,9 +182,9 @@ def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
         pad_id=-1,
         byte_fallback=False,
         normalization_rule_name="identity",
-        add_dummy_prefix=False,               # чтобы не подставлялся пробел в начале
+        add_dummy_prefix=False,               # не подставляем пробел в начале
         hard_vocab_limit=False,               # позволяем добавить служебные/байтовые юниты
-        user_defined_symbols=[CHATML_START, CHATML_END],
+        user_defined_symbols=[L3_BEGIN, L3_END, L3_S, L3_E, L3_EOT],  # Llama 3
     )
     return prefix.with_suffix(".model")
 
@@ -210,19 +211,18 @@ def load_lm_ids(sp: SentencePieceProcessor, path: Path) -> list[int]:
         ids_list.extend(encode_spm(sp, ex))
     return ids_list or [sp.bos_id(), sp.eos_id()]
 
-def render_chatml(system: str | None, user: str, assistant: str | None) -> str:
-    parts = []
+def render_llama3(system: str | None, user: str, assistant: str | None) -> str:
+    parts = [L3_BEGIN]
     if system and system.strip():
-        sys_clean = sanitize_text(system.strip())
-        parts.append(f"{CHATML_START}system\n{sys_clean}\n{CHATML_END}\n")
+        parts.append(f"{L3_S}system{L3_E}\n\n{sanitize_text(system.strip())}{L3_EOT}")
     usr_clean = sanitize_text(user.strip())
-    parts.append(f"{CHATML_START}user\n{usr_clean}\n{CHATML_END}\n")
+    parts.append(f"{L3_S}user{L3_E}\n\n{usr_clean}{L3_EOT}")
     if assistant is not None:
         as_clean = sanitize_text(assistant.strip())
-        parts.append(f"{CHATML_START}assistant\n{as_clean}\n{CHATML_END}\n")
+        parts.append(f"{L3_S}assistant{L3_E}\n\n{as_clean}{L3_EOT}")
     return "".join(parts)
 
-def load_sft_ids_chatml(sp: SentencePieceProcessor, jsonl_path: Path) -> list[int]:
+def load_sft_ids_llama3(sp: SentencePieceProcessor, jsonl_path: Path) -> list[int]:
     ids_list: list[int] = []
     with jsonl_path.open("r", encoding="utf-8") as f:
         for raw in f:
@@ -249,7 +249,7 @@ def load_sft_ids_chatml(sp: SentencePieceProcessor, jsonl_path: Path) -> list[in
                         if rsp is None and as_msgs:  rsp = as_msgs[-1]
                 if usr is None or rsp is None:
                     continue
-                text = render_chatml(system=None, user=usr, assistant=rsp)
+                text = render_llama3(system=None, user=usr, assistant=rsp)
             else:
                 text = sanitize_text(text)
             ids_list.extend(encode_spm(sp, text))
@@ -323,34 +323,31 @@ def export_to_gguf(model: LlamaModel, cfg: LlamaConfig, spm_path: Path, out_path
     writer.add_bos_token_id(int(_bos if _bos >= 0 else 1))
     writer.add_eos_token_id(int(_eos if _eos >= 0 else 2))
     writer.add_unk_token_id(int(_unk if _unk >= 0 else 0))
-    # === ChatML template ===
-    chatml_jinja = """{% for m in messages -%}
-    {% if m['role'] == 'system' -%}
-    <|im_start|>system
-    {{ m['content'] }}<|im_end|>
-    {% elif m['role'] == 'user' -%}
-    <|im_start|>user
-    {{ m['content'] }}<|im_end|>
-    {% elif m['role'] == 'assistant' -%}
-    <|im_start|>assistant
-    {{ m['content'] }}<|im_end|>
-    {% endif -%}
-    {% endfor -%}
-    {% if add_generation_prompt -%}
-    <|im_start|>assistant
-    {% endif -%}"""
-    writer.add_string("tokenizer.chat_template", chatml_jinja)
-    # Stop tokens: EOS + ChatML end marker (if present in vocab)
+
+    # Stop tokens: EOS + <|eot_id|> if present
     stop_ids = []
     if _eos >= 0: stop_ids.append(int(_eos))
     try:
-        im_end_id = sp.piece_to_id(CHATML_END)
-        if im_end_id >= 0:
-            stop_ids.append(int(im_end_id))
+        eot_id = sp.piece_to_id(L3_EOT)
+        if eot_id >= 0:
+            stop_ids.append(int(eot_id))
     except Exception:
         pass
     if stop_ids:
         _add_u32_list(writer, "tokenizer.ggml.stop_token_ids", stop_ids)
+
+    # Provide Llama 3 chat template (Jinja) for runtimes that consume it
+    llama3_chat_tmpl = (
+        "{{ bos_token }}"
+        "{% for message in messages %}"
+        "{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' + message['content'] + '<|eot_id|>' }}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}{% endif %}"
+    )
+    try:
+        writer.add_string("tokenizer.chat_template", llama3_chat_tmpl)
+    except Exception:
+        pass
 
     # FILE TYPE ↔ DTYPE
     out_dtype = "float16" if cfg.dtype == "float16" else "float32"
@@ -462,6 +459,8 @@ def run_epoch(model, opt, scaler, loader, device, progress_cb, epoch_i, epoch_T,
 def _auto_find_jsonl(base_dir: Path) -> str | None:
     """Try to find a JSONL dataset in priority order."""
     candidates = [
+        "dataset_llama3_nosystem.jsonl",
+        "dataset_llama3_text.jsonl",
         "dataset_chatml_nosystem.jsonl",
         "dataset_chatml_text.jsonl",
         "dataset.jsonl",
@@ -492,7 +491,7 @@ def train_once(run_name: str, data_path: str, models_dir: str,
 
     """
     If task == "lm":     train on TXT (data_path) only
-    If task == "sft":    train on JSONL (data_jsonl) only (ChatML)
+    If task == "sft":    train on JSONL (data_jsonl) only (Llama 3 chat)
     If task == "both":   LM first (epochs), then SFT (epochs_sft or 1)
     """
 
@@ -532,7 +531,7 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     if task in ("lm", "both"):
         lm_ids = load_lm_ids(sp, corpus)
     if task in ("sft", "both"):
-        sft_ids = load_sft_ids_chatml(sp, Path(data_jsonl))
+        sft_ids = load_sft_ids_llama3(sp, Path(data_jsonl))
 
     # === Model/Opt
     cfg = LlamaConfig(
@@ -554,7 +553,6 @@ def train_once(run_name: str, data_path: str, models_dir: str,
         progress_cb(f"Training started (device={device}, AMP={scaler.is_enabled()})")
 
     global_step = 0
-    # ---- LM phase
     # ---- LM phase
     if task in ("lm", "both") and lm_ids:
         if progress_cb: progress_cb("PHASE:LM start")
@@ -613,7 +611,7 @@ def cli_main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=str, default="run")
     ap.add_argument("--data", type=str, default="Datasets/dataset.txt", help="TXT corpus for tokenizer + LM")
-    ap.add_argument("--jsonl", type=str, default=None, help="JSONL for SFT (ChatML or fields to render)")
+    ap.add_argument("--jsonl", type=str, default=None, help="JSONL for SFT (Llama 3 chat or fields to render)")
     ap.add_argument("--models", type=str, default="Models")
     ap.add_argument("--task", type=str, default="both", choices=["lm", "sft", "both"])  # BOTH by default
     ap.add_argument("--vocab", type=int, default=32000)
