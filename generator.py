@@ -148,7 +148,7 @@ class LlamaModel(nn.Module):
         return logits, loss
 
 # ----------------------------
-# Sanitize: удаление управляющих ASCII (кроме \n и \t)
+# Sanitize + dataset placeholder fixes
 # ----------------------------
 _CLEAN_CC = re.compile(
     r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]"               # ASCII control (без \n,\t)
@@ -157,10 +157,46 @@ _CLEAN_CC = re.compile(
     r"|[\uFFFE\uFFFF]"                                # noncharacters U+FFFE/FFFF
 , flags=re.UNICODE)
 
+# Удаляем строки-фенсы с ```
+_CODEFENCE = re.compile(r"^```.*?$", flags=re.MULTILINE)
+
+# Маркеры hex-байтов, попавшие в корпус как текст
+_HEX_TAG = re.compile(r"<0x([0-9A-Fa-f]{2})>")
+
+# Диагностические подписи CR/LF, попавшие в корпус
+_DIAG = re.compile(r"(?:CR13|LF10|CR|LF)\b", flags=re.IGNORECASE)
+
+def _hex_tag_to_byte(m: re.Match) -> str:
+    b = bytes([int(m.group(1), 16)])
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        v = b[0]
+        if v == 0x0D:   # CR
+            return "\n"
+        if v == 0x0A:   # LF
+            return "\n"
+        if v == 0x09:   # TAB
+            return "\t"
+        return b.decode("latin-1")
+
+def decode_hex_placeholders(text: str) -> str:
+    """Преобразует последовательности вида <0xHH> обратно в символы/байты."""
+    if not text:
+        return ""
+    return _HEX_TAG.sub(_hex_tag_to_byte, text)
+
+def strip_diag_markers(text: str) -> str:
+    """Удаляет текстовые маркеры CR13/LF10/CR/LF, если они попали в корпус."""
+    if not text:
+        return ""
+    return _DIAG.sub("", text)
+
 def sanitize_text(s: str) -> str:
-    """Удаляет мусорные управляющие символы из строки."""
+    """Удаляет мусорные управляющие символы и мягко убирает строки-кодовые фенсы."""
     if not s:
         return ""
+    s = _CODEFENCE.sub("", s)
     return _CLEAN_CC.sub("", s)
 
 # ----------------------------
@@ -209,12 +245,23 @@ class TextDataset(Dataset):
 
 def load_lm_ids(sp: SentencePieceProcessor, path: Path) -> list[int]:
     text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    # Новые шаги: распаковать <0xHH>, убрать диагностические маркеры
+    text = decode_hex_placeholders(text)
+    text = strip_diag_markers(text)
+    # Санитизация и сплит
     text = sanitize_text(text)
     paragraphs = [p.strip() for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
     ids_list: list[int] = []
     for ex in paragraphs:
         ids_list.extend(encode_spm(sp, ex))
     return ids_list or [sp.bos_id(), sp.eos_id()]
+
+def _clean_field_for_sft(s: str | None) -> str | None:
+    if s is None: return None
+    s = decode_hex_placeholders(s)
+    s = strip_diag_markers(s)
+    s = sanitize_text(s)
+    return s
 
 def render_llama3(system: str | None, user: str, assistant: str | None) -> str:
     parts = [L3_BEGIN]
@@ -238,26 +285,41 @@ def load_sft_ids_llama3(sp: SentencePieceProcessor, jsonl_path: Path) -> list[in
                 ex = json.loads(line)
             except Exception:
                 continue
+
             text = ex.get("text")
-            if not text:
-                sys_ = ex.get("system", "")
-                usr = ex.get("prompt") or ex.get("user") or ex.get("input") or ex.get("question")
-                rsp = ex.get("response") or ex.get("assistant") or ex.get("answer")
-                if usr is None or rsp is None:
-                    msgs = ex.get("messages")
-                    if isinstance(msgs, list) and msgs:
-                        sys_msgs = [m.get("content","") for m in msgs if m.get("role")=="system"]
-                        usr_msgs = [m.get("content","") for m in msgs if m.get("role")=="user"]
-                        as_msgs  = [m.get("content","") for m in msgs if m.get("role")=="assistant"]
-                        if not sys_ and sys_msgs: sys_ = sys_msgs[0]
-                        if usr is None and usr_msgs: usr = usr_msgs[-1]
-                        if rsp is None and as_msgs:  rsp = as_msgs[-1]
-                if usr is None or rsp is None:
+            if text:
+                # Чистим text, если он уже содержит готовую «склейку»
+                text = _clean_field_for_sft(text)
+                if not text:
                     continue
-                text = render_llama3(system=None, user=usr, assistant=rsp)
-            else:
-                text = sanitize_text(text)
-            ids_list.extend(encode_spm(sp, text))
+                ids_list.extend(encode_spm(sp, text))
+                continue
+
+            # Иначе пробуем полями
+            sys_ = ex.get("system", "")
+            usr = ex.get("prompt") or ex.get("user") or ex.get("input") or ex.get("question")
+            rsp = ex.get("response") or ex.get("assistant") or ex.get("answer")
+
+            if usr is None or rsp is None:
+                msgs = ex.get("messages")
+                if isinstance(msgs, list) and msgs:
+                    sys_msgs = [m.get("content","") for m in msgs if m.get("role")=="system"]
+                    usr_msgs = [m.get("content","") for m in msgs if m.get("role")=="user"]
+                    as_msgs  = [m.get("content","") for m in msgs if m.get("role")=="assistant"]
+                    if (not sys_) and sys_msgs: sys_ = sys_msgs[0]
+                    if usr is None and usr_msgs: usr = usr_msgs[-1]
+                    if rsp is None and as_msgs:  rsp = as_msgs[-1]
+
+            usr = _clean_field_for_sft(usr) if usr is not None else None
+            rsp = _clean_field_for_sft(rsp) if rsp is not None else None
+            sys_ = _clean_field_for_sft(sys_) if sys_ is not None else None
+
+            if usr is None or rsp is None:
+                continue
+
+            rendered = render_llama3(system=None, user=usr, assistant=rsp)
+            ids_list.extend(encode_spm(sp, rendered))
+
     return ids_list or [sp.bos_id(), sp.eos_id()]
 
 # ----------------------------
