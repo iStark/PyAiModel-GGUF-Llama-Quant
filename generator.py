@@ -208,11 +208,72 @@ L3_S     = "<|start_header_id|>"
 L3_E     = "<|end_header_id|>"
 L3_EOT   = "<|eot_id|>"
 
-def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
+# ----------------------------
+# SentencePiece training corpus (TXT + JSONL merge)
+# ----------------------------
+def _collect_text_for_spm(txt_path: Path, jsonl_path: Path | None) -> str:
+    """
+    Собирает текст для обучения SentencePiece из двух источников:
+    - TXT (по строкам)
+    - JSONL (по полям: text/system/user/prompt/input/question/response/assistant/answer + messages[].content)
+    Выполняет декодирование <0xHH>, снос диагностических маркеров, санитизацию и нормализацию \n.
+    """
+    # TXT
+    txt = txt_path.read_text(encoding="utf-8", errors="ignore")
+    txt = decode_hex_placeholders(txt)
+    txt = strip_diag_markers(txt)
+    txt = sanitize_text(txt)
+
+    # JSONL (optional)
+    if jsonl_path and jsonl_path.exists():
+        with jsonl_path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+
+                # Набор популярных ключей
+                for k in ("text", "system", "user", "prompt", "input", "question",
+                          "response", "assistant", "answer"):
+                    v = obj.get(k)
+                    if isinstance(v, str) and v.strip():
+                        v2 = sanitize_text(strip_diag_markers(decode_hex_placeholders(v)))
+                        if v2:
+                            txt += "\n" + v2
+
+                # messages=[{role, content}]
+                msgs = obj.get("messages")
+                if isinstance(msgs, list):
+                    for m in msgs:
+                        c = m.get("content")
+                        if isinstance(c, str) and c.strip():
+                            c2 = sanitize_text(strip_diag_markers(decode_hex_placeholders(c)))
+                            if c2:
+                                txt += "\n" + c2
+
+    return txt.replace("\r\n", "\n").strip()
+
+def train_sentencepiece_bpe(corpus_txt: Path, out_dir: Path, vocab_size: int, jsonl_for_vocab: Path | None):
+    """
+    Обучает SentencePiece (BPE) на объединённом корпусе:
+    - основной TXT
+    - + JSONL (если передан), поля и messages[].content добавляются построчно
+    user_defined_symbols — Llama 3 спец-токены; byte_fallback — включён.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # соберём временный объединённый корпус для SPM
+    merged = _collect_text_for_spm(corpus_txt, jsonl_for_vocab)
+    tmp_corpus = out_dir / "tokenizer_corpus.tmp.txt"
+    tmp_corpus.write_text(merged, encoding="utf-8")
+
     prefix = out_dir / "tokenizer"
     spm.SentencePieceTrainer.Train(
-        input=str(corpus),
+        input=str(tmp_corpus),
         model_prefix=str(prefix),
         vocab_size=vocab_size,
         model_type="bpe",
@@ -227,6 +288,13 @@ def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
         hard_vocab_limit=False,               # позволяем добавить служебные/байтовые юниты
         user_defined_symbols=[L3_BEGIN, L3_END, L3_S, L3_E, L3_EOT],  # Llama 3
     )
+
+    # прибираем временный файл
+    try:
+        tmp_corpus.unlink()
+    except Exception:
+        pass
+
     return prefix.with_suffix(".model")
 
 def encode_spm(sp: SentencePieceProcessor, text: str):
@@ -245,10 +313,8 @@ class TextDataset(Dataset):
 
 def load_lm_ids(sp: SentencePieceProcessor, path: Path) -> list[int]:
     text = Path(path).read_text(encoding="utf-8", errors="ignore")
-    # Новые шаги: распаковать <0xHH>, убрать диагностические маркеры
     text = decode_hex_placeholders(text)
     text = strip_diag_markers(text)
-    # Санитизация и сплит
     text = sanitize_text(text)
     paragraphs = [p.strip() for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
     ids_list: list[int] = []
@@ -285,21 +351,17 @@ def load_sft_ids_llama3(sp: SentencePieceProcessor, jsonl_path: Path) -> list[in
                 ex = json.loads(line)
             except Exception:
                 continue
-
             text = ex.get("text")
             if text:
-                # Чистим text, если он уже содержит готовую «склейку»
                 text = _clean_field_for_sft(text)
                 if not text:
                     continue
                 ids_list.extend(encode_spm(sp, text))
                 continue
-
-            # Иначе пробуем полями
+            # поля
             sys_ = ex.get("system", "")
             usr = ex.get("prompt") or ex.get("user") or ex.get("input") or ex.get("question")
             rsp = ex.get("response") or ex.get("assistant") or ex.get("answer")
-
             if usr is None or rsp is None:
                 msgs = ex.get("messages")
                 if isinstance(msgs, list) and msgs:
@@ -309,17 +371,13 @@ def load_sft_ids_llama3(sp: SentencePieceProcessor, jsonl_path: Path) -> list[in
                     if (not sys_) and sys_msgs: sys_ = sys_msgs[0]
                     if usr is None and usr_msgs: usr = usr_msgs[-1]
                     if rsp is None and as_msgs:  rsp = as_msgs[-1]
-
             usr = _clean_field_for_sft(usr) if usr is not None else None
             rsp = _clean_field_for_sft(rsp) if rsp is not None else None
             sys_ = _clean_field_for_sft(sys_) if sys_ is not None else None
-
             if usr is None or rsp is None:
                 continue
-
             rendered = render_llama3(system=None, user=usr, assistant=rsp)
             ids_list.extend(encode_spm(sp, rendered))
-
     return ids_list or [sp.bos_id(), sp.eos_id()]
 
 # ----------------------------
@@ -560,16 +618,6 @@ def train_once(run_name: str, data_path: str, models_dir: str,
 
     models_dir = Path(models_dir); models_dir.mkdir(parents=True, exist_ok=True)
 
-    # === Tokenizer (SPM BPE) trained from TXT corpus ===
-    corpus = Path(data_path)
-    assert corpus.is_file(), f"Missing tokenizer corpus {data_path}"
-    run_dir = models_dir / run_name
-    if run_dir.exists(): shutil.rmtree(run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    spm_path = train_sentencepiece_bpe(corpus, run_dir, vocab_size)
-    sp = SentencePieceProcessor(model_file=str(spm_path))
-    n_sp = sp.vocab_size()
-
     # === Resolve JSONL automatically if needed (for SFT or BOTH)
     if task in ("sft", "both") and not data_jsonl:
         auto = _auto_find_jsonl(Path("Datasets"))
@@ -579,13 +627,26 @@ def train_once(run_name: str, data_path: str, models_dir: str,
         if progress_cb:
             progress_cb(f'ENV {json.dumps({"auto_jsonl": data_jsonl})}')
 
+    # === Tokenizer (SPM BPE) trained from TXT + JSONL (if provided)
+    corpus = Path(data_path)
+    assert corpus.is_file(), f"Missing tokenizer corpus {data_path}"
+    jsonl_path = Path(data_jsonl) if data_jsonl else None
+
+    run_dir = models_dir / run_name
+    if run_dir.exists(): shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    spm_path = train_sentencepiece_bpe(corpus, run_dir, vocab_size, jsonl_for_vocab=jsonl_path)
+    sp = SentencePieceProcessor(model_file=str(spm_path))
+    n_sp = sp.vocab_size()
+
     # === Build training ids (LM / SFT / BOTH)
     lm_ids: list[int] = []
     sft_ids: list[int] = []
     if task in ("lm", "both"):
         lm_ids = load_lm_ids(sp, corpus)
-    if task in ("sft", "both"):
-        sft_ids = load_sft_ids_llama3(sp, Path(data_jsonl))
+    if task in ("sft", "both") and jsonl_path:
+        sft_ids = load_sft_ids_llama3(sp, jsonl_path)
 
     # === Model/Opt
     cfg = LlamaConfig(
@@ -665,7 +726,7 @@ def cli_main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=str, default="run")
     ap.add_argument("--data", type=str, default="Datasets/dataset.txt", help="TXT corpus for tokenizer + LM")
-    ap.add_argument("--jsonl", type=str, default=None, help="JSONL for SFT (Llama 3 chat or fields to render)")
+    ap.add_argument("--jsonl", type=str, default=None, help="JSONL for SFT (also used for vocab merge)")
     ap.add_argument("--models", type=str, default="Models")
     ap.add_argument("--task", type=str, default="both", choices=["lm", "sft", "both"])  # BOTH by default
     ap.add_argument("--vocab", type=int, default=32000)
@@ -681,7 +742,7 @@ def cli_main():
     ap.add_argument("--workers", type=int, default=None, help="DataLoader workers (override)")
     ap.add_argument("--dtype", type=str, default="float16", choices=["float16", "float32", "bfloat16"])
     ap.add_argument("--quant", type=str, default=None, help="e.g. Q3_K_L, Q4_K_M, Q5_K_S, Q8_0, IQ4_NL ...")
-    ap.add_argument("--quant-bin", type=str, default=None, help="path to llama-quantize if not in PATH")
+    ap.add_argument("--quant-bin", type_str := str, default=None, help="path to llama-quantize if not in PATH")
     ap.add_argument("--no-keep-fp16", action="store_true", help="remove original FP16/FP32 after quantization")
     args = ap.parse_args()
 
