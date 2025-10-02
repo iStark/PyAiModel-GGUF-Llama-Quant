@@ -150,7 +150,12 @@ class LlamaModel(nn.Module):
 # ----------------------------
 # Sanitize: удаление управляющих ASCII (кроме \n и \t)
 # ----------------------------
-_CLEAN_CC = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+_CLEAN_CC = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]"               # ASCII control (без \n,\t)
+    r"|[\uD800-\uDFFF]"                               # суррогаты UTF-16
+    r"|[\uFDD0-\uFDEF]"                               # noncharacters U+FDD0..FDEF
+    r"|[\uFFFE\uFFFF]"                                # noncharacters U+FFFE/FFFF
+, flags=re.UNICODE)
 
 def sanitize_text(s: str) -> str:
     """Удаляет мусорные управляющие символы из строки."""
@@ -180,7 +185,7 @@ def train_sentencepiece_bpe(corpus: Path, out_dir: Path, vocab_size: int):
         eos_id=2,
         unk_id=0,
         pad_id=-1,
-        byte_fallback=False,
+        byte_fallback=True,
         normalization_rule_name="identity",
         add_dummy_prefix=False,               # не подставляем пробел в начале
         hard_vocab_limit=False,               # позволяем добавить служебные/байтовые юниты
@@ -335,19 +340,6 @@ def export_to_gguf(model: LlamaModel, cfg: LlamaConfig, spm_path: Path, out_path
         pass
     if stop_ids:
         _add_u32_list(writer, "tokenizer.ggml.stop_token_ids", stop_ids)
-
-    # Provide Llama 3 chat template (Jinja) for runtimes that consume it
-    llama3_chat_tmpl = (
-        "{{ bos_token }}"
-        "{% for message in messages %}"
-        "{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' + message['content'] + '<|eot_id|>' }}"
-        "{% endfor %}"
-        "{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}{% endif %}"
-    )
-    try:
-        writer.add_string("tokenizer.chat_template", llama3_chat_tmpl)
-    except Exception:
-        pass
 
     # FILE TYPE ↔ DTYPE
     out_dtype = "float16" if cfg.dtype == "float16" else "float32"
