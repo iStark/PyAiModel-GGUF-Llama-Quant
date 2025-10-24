@@ -85,14 +85,14 @@ textarea.template{width:100%;min-height:150px}
       <div class="sep"></div>
 
       <div class="row">
-        <label>Vocab <input id="vocab" type="number" value="32000" min="2000" max="200000"></label>
-        <label>D_model <input id="dmodel" type="number" value="512" min="128" max="4096"></label>
-        <label>Heads <input id="heads" type="number" value="8" min="1" max="64"></label>
-        <label>Layers <input id="layers" type="number" value="8" min="1" max="80"></label>
+        <label>Vocab <input id="vocab" type="number" value="60000" min="2000" max="200000"></label>
+        <label>D_model <input id="dmodel" type="number" value="576" min="128" max="4096"></label>
+        <label>Heads <input id="heads" type="number" value="9" min="1" max="64"></label>
+        <label>Layers <input id="layers" type="number" value="9" min="1" max="80"></label>
         <label>Seq <input id="seq" type="number" value="256" min="32" max="8192"></label>
         <label>Batch <input id="bs" type="number" value="64" min="1" max="4096"></label>
-        <label>Epochs (LM) <input id="ep" type="number" value="2" min="1" max="100"></label>
-        <label>Epochs SFT <input id="ep_sft" type="number" value="1" min="1" max="100"></label>
+        <label>Epochs (LM) <input id="ep" type="number" value="4" min="1" max="100"></label>
+        <label>Epochs SFT <input id="ep_sft" type="number" value="3" min="1" max="100"></label>
         <label>LR <input id="lr" step="0.0001" type="number" value="0.0003"></label>
         <label><input id="amp" type="checkbox" checked> Use AMP (Tensor Cores)</label>
       </div>
@@ -121,7 +121,27 @@ textarea.template{width:100%;min-height:150px}
         <label>llama-quantize path <input id="quant_bin" type="text" placeholder="auto from PATH"></label>
         <label><input id="del_fp16" type="checkbox"> Delete FP16/FP32 after quant</label>
       </div>
+<div class="sep"></div>
 
+      <div class="row">
+        <h3 style="margin:0 0 6px 0;width:100%;">Multi-GPU (2-GPU pipeline)</h3>
+        <label>
+          <input id="mgpu_enable" type="checkbox">
+          Enable 2-GPU pipeline
+        </label>
+        <label title="Сколько первых блоков уедет на малую видеокарту (например GTX 1060 3GB)">
+          Pipeline split
+          <input id="mgpu_split" type="number" value="1" min="0" max="999">
+        </label>
+        <label title="Индекс основной (большой) видеокарты, обычно 0 (RTX 3070 Ti)">
+          Big GPU index
+          <input id="mgpu_big" type="number" value="0" min="0" max="15">
+        </label>
+        <label title="Индекс малой видеокарты, обычно 1 (GTX 1060 3GB)">
+          Small GPU index
+          <input id="mgpu_small" type="number" value="1" min="0" max="15">
+        </label>
+      </div>
       <button id="btn">Start training</button>
     </form>
   </div>
@@ -209,7 +229,9 @@ textarea.template{width:100%;min-height:150px}
     try{
       const env = JSON.parse(payload);
       let dev = env.device || '—';
-      if (env.cuda_name0) dev += ` (${env.cuda_name0})`;
+      if (Array.isArray(env.cuda_names) && env.cuda_names.length) {
+        dev += ' — ' + env.cuda_names.map((n,i)=>`GPU${i}: ${n}`).join(', ');
+      }
       const amp = env.cuda_available ? 'True' : 'False';
       $('s_device').textContent = dev + ' | AMP: ' + amp;
 
@@ -250,6 +272,12 @@ textarea.template{width:100%;min-height:150px}
       quant_bin: val('quant_bin') || '',
       del_fp16: $('del_fp16').checked ? '1':'0'
     });
+     // --- Multi-GPU params ---
+    const mgpuOn   = $('mgpu_enable').checked;
+    const mgpuSplit= mgpuOn ? (parseInt($('mgpu_split').value||'0',10)||0) : 0;
+    params.set('pipeline_split', String(mgpuSplit));
+    params.set('big_dev',  String(parseInt($('mgpu_big').value||'0',10)||0));
+    params.set('small_dev',String(parseInt($('mgpu_small').value||'1',10)||1));
 
     es  = new EventSource('/train?' + params.toString());
     const log = $('log');
@@ -313,13 +341,13 @@ def train_route():
     txt  = request.args.get("txt", "dataset.txt").strip()
     jsonl = request.args.get("jsonl", "").strip() or None
 
-    vocab = int(request.args.get("vocab", 32000))
-    dmodel = int(request.args.get("dmodel", 512))
-    heads  = int(request.args.get("heads", 8))
-    layers = int(request.args.get("layers", 8))
+    vocab = int(request.args.get("vocab", 60000))
+    dmodel = int(request.args.get("dmodel", 576))
+    heads  = int(request.args.get("heads", 9))
+    layers = int(request.args.get("layers", 9))
     seq    = int(request.args.get("seq", 256))
     bs     = int(request.args.get("bs", 64))
-    ep     = int(request.args.get("ep", 2))
+    ep     = int(request.args.get("ep", 4))
     ep_sft = request.args.get("ep_sft", "")
     ep_sft = int(ep_sft) if ep_sft.strip().isdigit() else None
     lr     = float(request.args.get("lr", 0.0003))
@@ -328,7 +356,10 @@ def train_route():
     quant  = request.args.get("quant", "").strip() or None
     quant_bin = request.args.get("quant_bin", "").strip() or None
     del_fp16 = request.args.get("del_fp16", "0") == "1"
-
+    # --- Multi-GPU ---
+    pipeline_split = int(request.args.get("pipeline_split", 0))
+    big_dev = int(request.args.get("big_dev", 0))
+    small_dev = int(request.args.get("small_dev", 1))
     data_path = str(Path("Datasets") / txt)
     data_jsonl = str(Path("Datasets") / jsonl) if jsonl else None
     models_dir = "Models"
@@ -366,7 +397,11 @@ def train_route():
                 # extended args
                 task=task,
                 data_jsonl=data_jsonl,
-                epochs_sft=ep_sft
+                epochs_sft=ep_sft,
+                # Multi-GPU
+                pipeline_split=pipeline_split,
+                big_dev=big_dev,
+                small_dev=small_dev
             )
             q.put(f"Saved weights: {saved_path}")
         except Exception as e:

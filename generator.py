@@ -37,6 +37,12 @@ class LlamaConfig:
     rms_eps: float = 1e-5
     dtype: str = "float16"  # export dtype: float16|float32 (bfloat16 -> cast to f32)
 
+def _module_device(m: nn.Module) -> torch.device:
+    try:
+        return next(m.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
 def _head_dim(cfg: LlamaConfig) -> int:
     return cfg.n_embd // cfg.n_head
 
@@ -137,10 +143,27 @@ class LlamaModel(nn.Module):
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)  # NOT tied
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        x = self.tok_emb(idx)
+
+        # x начинаем на том девайсе, где хранится embedding
+        dev_tok = _module_device(self.tok_emb)
+        x = self.tok_emb(idx.to(dev_tok, non_blocking=True))
+
+        # прогоняем слои; перед каждым блоком переносим x на устройство блока
         for blk in self.blocks:
+            dev_blk = _module_device(blk)
+            if x.device != dev_blk:
+                x = x.to(dev_blk, non_blocking=True)
             x = blk(x)
+
+        # нормализация и lm_head — на их девайсах
+        dev_norm = _module_device(self.norm)
+        if x.device != dev_norm:
+            x = x.to(dev_norm, non_blocking=True)
         x = self.norm(x)
+
+        dev_head = _module_device(self.lm_head)
+        if x.device != dev_head:
+            x = x.to(dev_head, non_blocking=True)
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
@@ -599,7 +622,11 @@ def train_once(run_name: str, data_path: str, models_dir: str,
                # NEW:
                task: str = "both",                 # default BOTH
                data_jsonl: str | None = None,      # path to JSONL for SFT
-               epochs_sft: int | None = None) -> str:
+               epochs_sft: int | None = None,
+               pipeline_split: int = 0,
+               big_dev: int = 0,
+               small_dev: int = 1) -> str:
+
 
     """
     If task == "lm":     train on TXT (data_path) only
@@ -609,12 +636,16 @@ def train_once(run_name: str, data_path: str, models_dir: str,
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if progress_cb:
-        progress_cb(json.dumps({
+        info = {
             "device": device,
             "cuda_available": torch.cuda.is_available(),
-            "cuda_name0": (torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),
             "torch": torch.__version__,
-        }))
+        }
+        if torch.cuda.is_available():
+            cnt = torch.cuda.device_count()
+            info["cuda_count"] = cnt
+            info["cuda_names"] = [torch.cuda.get_device_name(i) for i in range(cnt)]
+        progress_cb(json.dumps(info))
 
     models_dir = Path(models_dir); models_dir.mkdir(parents=True, exist_ok=True)
 
@@ -656,7 +687,36 @@ def train_once(run_name: str, data_path: str, models_dir: str,
         n_kv_head=(kv_heads if kv_heads is not None else n_head),
         n_embd=n_embd, block_size=block_size, dtype=weight_dtype
     )
-    model = LlamaModel(cfg).to(device)
+    model = LlamaModel(cfg)
+
+    # --- Минимальный pipeline-parallel на 2 GPU ---
+    # Идея: часть ранних блоков кидаем на small_dev (например, 1 — GTX 1060 3GB),
+    # остальное + финальные слои держим на big_dev (например, 0 — RTX 3070 Ti).
+    if device == "cuda" and torch.cuda.device_count() >= 2 and pipeline_split > 0:
+        big = torch.device(f"cuda:{big_dev}")
+        small = torch.device(f"cuda:{small_dev}")
+
+        # Сколько реально можно отдать на малую карту
+        split = max(1, min(pipeline_split, cfg.n_layer - 1))
+
+        # Embedding и первые split блоков — на small
+        model.tok_emb.to(small)
+        for i in range(split):
+            model.blocks[i].to(small)
+
+        # Остальные блоки + norm + head — на big
+        for i in range(split, cfg.n_layer):
+            model.blocks[i].to(big)
+        model.norm.to(big)
+        model.lm_head.to(big)
+
+        if progress_cb:
+            progress_cb(
+                f"ENV {json.dumps({'pipeline': '2-gpu', 'split': split, 'big_dev': big_dev, 'small_dev': small_dev})}")
+    else:
+        # Одно устройство как раньше
+        model = model.to(device)
+
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda" and amp))
 
@@ -739,6 +799,10 @@ def cli_main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=2, help="LM epochs (or SFT if task=sft)")
     ap.add_argument("--epochs-sft", type=int, default=None, help="SFT epochs (only used if task=both)")
+    ap.add_argument("--pipeline-split", type=int, default=0,
+                    help="Сколько первых блоков держать на второй GPU (0=выключено)")
+    ap.add_argument("--big-dev", type=int, default=0, help="Индекс основной (большой) GPU")
+    ap.add_argument("--small-dev", type=int, default=1, help="Индекс второй (малой) GPU")
     ap.add_argument("--workers", type=int, default=None, help="DataLoader workers (override)")
     ap.add_argument("--dtype", type=str, default="float16", choices=["float16", "float32", "bfloat16"])
     ap.add_argument("--quant", type=str, default=None, help="e.g. Q3_K_L, Q4_K_M, Q5_K_S, Q8_0, IQ4_NL ...")
@@ -772,6 +836,10 @@ def cli_main():
         keep_fp16=(not args.no_keep_fp16),
         workers=args.workers,
         task=args.task,
+        # NEW MULTI GPU
+        pipeline_split=args.pipeline_split,
+        big_dev=args.big_dev,
+        small_dev=args.small_dev,
         epochs_sft=args.epochs_sft
     )
 
