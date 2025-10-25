@@ -85,12 +85,12 @@ textarea.template{width:100%;min-height:150px}
       <div class="sep"></div>
 
       <div class="row">
-        <label>Vocab <input id="vocab" type="number" value="60000" min="2000" max="200000"></label>
-        <label>D_model <input id="dmodel" type="number" value="576" min="128" max="4096"></label>
-        <label>Heads <input id="heads" type="number" value="9" min="1" max="64"></label>
-        <label>Layers <input id="layers" type="number" value="9" min="1" max="80"></label>
+        <label>Vocab <input id="vocab" type="number" value="30000" min="2000" max="200000"></label>
+        <label>D_model <input id="dmodel" type="number" value="256" min="128" max="4096"></label>
+        <label>Heads <input id="heads" type="number" value="4" min="1" max="64"></label>
+        <label>Layers <input id="layers" type="number" value="4" min="1" max="80"></label>
         <label>Seq <input id="seq" type="number" value="256" min="32" max="8192"></label>
-        <label>Batch <input id="bs" type="number" value="64" min="1" max="4096"></label>
+        <label>Batch <input id="bs" type="number" value="48" min="1" max="4096"></label>
         <label>Epochs (LM) <input id="ep" type="number" value="4" min="1" max="100"></label>
         <label>Epochs SFT <input id="ep_sft" type="number" value="3" min="1" max="100"></label>
         <label>LR <input id="lr" step="0.0001" type="number" value="0.0003"></label>
@@ -341,12 +341,12 @@ def train_route():
     txt  = request.args.get("txt", "dataset.txt").strip()
     jsonl = request.args.get("jsonl", "").strip() or None
 
-    vocab = int(request.args.get("vocab", 60000))
-    dmodel = int(request.args.get("dmodel", 576))
-    heads  = int(request.args.get("heads", 9))
-    layers = int(request.args.get("layers", 9))
+    vocab = int(request.args.get("vocab", 30000))
+    dmodel = int(request.args.get("dmodel", 256))
+    heads  = int(request.args.get("heads", 4))
+    layers = int(request.args.get("layers", 4))
     seq    = int(request.args.get("seq", 256))
-    bs     = int(request.args.get("bs", 64))
+    bs     = int(request.args.get("bs", 48))
     ep     = int(request.args.get("ep", 4))
     ep_sft = request.args.get("ep_sft", "")
     ep_sft = int(ep_sft) if ep_sft.strip().isdigit() else None
@@ -411,17 +411,27 @@ def train_route():
             TRAIN_LOCK.release()
 
     Thread(target=worker, daemon=True).start()
+    q.put('ENV {"sse":"open"}')
 
     def stream():
+        last = time.time()
         while True:
             try:
                 msg = q.get(timeout=1.0)
                 yield _sse(msg)
-                if msg == "DONE": break
+                last = time.time()
+                if msg == "DONE":
+                    break
             except Empty:
-                pass
+                # отправляем keepalive каждые 10 секунд, чтобы соединение не падало
+                if time.time() - last > 10:
+                    yield ":\n\n"
+                    last = time.time()
 
-    return Response(stream_with_context(stream()), mimetype="text/event-stream")
+    resp = Response(stream_with_context(stream()), mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"  # важно для nginx/uwsgi, отключает буфер
+    return resp
 
 
 if __name__ == "__main__":

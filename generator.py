@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from tqdm import tqdm
 
 import sentencepiece as spm
@@ -45,7 +45,16 @@ def _module_device(m: nn.Module) -> torch.device:
 
 def _head_dim(cfg: LlamaConfig) -> int:
     return cfg.n_embd // cfg.n_head
+def _gpu_props(idx: int):
+    p = torch.cuda.get_device_properties(idx)
+    return {"name": p.name, "total_mem": int(p.total_memory), "cc": (p.major, p.minor)}
 
+def _has_tensor_cores(idx: int) -> bool:
+    p = torch.cuda.get_device_properties(idx)
+    return (p.major, p.minor) >= (7, 0)  # Volta+
+
+def _bytes_gb(b: int) -> float:
+    return b / (1024**3)
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -77,6 +86,10 @@ class LlamaAttention(nn.Module):
     def __init__(self, cfg: LlamaConfig):
         super().__init__()
         d = cfg.n_embd
+        grad_checkpointing: bool = True
+        big_dev: int = 0
+        small_dev: int = 1
+        hybrid_small_pascal: bool = False  # когда малый GPU = Pascal, считаем там без AMP
         self.n_head = cfg.n_head
         self.n_kv = cfg.n_kv_head
         assert self.n_head % self.n_kv == 0, "n_head must be divisible by n_kv_head for GQA"
@@ -153,7 +166,33 @@ class LlamaModel(nn.Module):
             dev_blk = _module_device(blk)
             if x.device != dev_blk:
                 x = x.to(dev_blk, non_blocking=True)
-            x = blk(x)
+
+            use_amp_here = False
+            if self.training and getattr(self.cfg, "grad_checkpointing", False):
+                # с чекпоинтингом экономим память
+                if getattr(self.cfg, "hybrid_small_pascal", False):
+                    # AMP только на big_dev
+                    if dev_blk.index == getattr(self.cfg, "big_dev", 0):
+                        use_amp_here = torch.is_autocast_enabled() or True  # разрешаем
+                    else:
+                        use_amp_here = False
+                else:
+                    # обычный случай — следуем внешнему autocast
+                    use_amp_here = torch.is_autocast_enabled()
+                if use_amp_here:
+                    with torch.amp.autocast("cuda", enabled=True):
+                        x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+                else:
+                    with torch.amp.autocast("cuda", enabled=False):
+                        x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            else:
+                # без чекпоинтинга
+                if getattr(self.cfg, "hybrid_small_pascal", False):
+                    use_amp_here = (dev_blk.index == getattr(self.cfg, "big_dev", 0))
+                else:
+                    use_amp_here = torch.is_autocast_enabled()
+                with torch.amp.autocast("cuda", enabled=use_amp_here):
+                    x = blk(x)
 
         # нормализация и lm_head — на их девайсах
         dev_norm = _module_device(self.norm)
@@ -167,6 +206,8 @@ class LlamaModel(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
+            if targets.device != logits.device:
+                targets = targets.to(logits.device, non_blocking=True)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
@@ -280,21 +321,58 @@ def _collect_text_for_spm(txt_path: Path, jsonl_path: Path | None) -> str:
 
     return txt.replace("\r\n", "\n").strip()
 
-def train_sentencepiece_bpe(corpus_txt: Path, out_dir: Path, vocab_size: int, jsonl_for_vocab: Path | None):
+def train_sentencepiece_bpe(corpus_txt: Path, out_dir: Path, vocab_size: int, jsonl_for_vocab: Path | None, progress_cb=None):
     """
-    Обучает SentencePiece (BPE) на объединённом корпусе:
+    Обучает SentencePiece (BPE) на объединённом корпусе потоково:
     - основной TXT
-    - + JSONL (если передан), поля и messages[].content добавляются построчно
-    user_defined_symbols — Llama 3 спец-токены; byte_fallback — включён.
+    - + JSONL (если передан): добираем поля/messages
+    Ничего не держим в одной гигантской строке — пишем во временный файл построчно.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # соберём временный объединённый корпус для SPM
-    merged = _collect_text_for_spm(corpus_txt, jsonl_for_vocab)
     tmp_corpus = out_dir / "tokenizer_corpus.tmp.txt"
-    tmp_corpus.write_text(merged, encoding="utf-8")
+
+    with tmp_corpus.open("w", encoding="utf-8") as out:
+        # TXT -> stream
+        if progress_cb: progress_cb('ENV {"phase":"spm_merge","part":"txt","status":"start"}')
+        with corpus_txt.open("r", encoding="utf-8", errors="ignore") as ftxt:
+            for line in ftxt:
+                line = sanitize_text(strip_diag_markers(decode_hex_placeholders(line.rstrip("\n"))))
+                if line:
+                    out.write(line + "\n")
+        if progress_cb: progress_cb('ENV {"phase":"spm_merge","part":"txt","status":"done"}')
+
+        # JSONL -> stream
+        if jsonl_for_vocab and jsonl_for_vocab.exists():
+            if progress_cb: progress_cb('ENV {"phase":"spm_merge","part":"jsonl","status":"start"}')
+            with jsonl_for_vocab.open("r", encoding="utf-8", errors="ignore") as fj:
+                for raw in fj:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        continue
+                    # поля
+                    for k in ("text","system","user","prompt","input","question","response","assistant","answer"):
+                        v = obj.get(k)
+                        if isinstance(v, str) and v.strip():
+                            v2 = sanitize_text(strip_diag_markers(decode_hex_placeholders(v)))
+                            if v2:
+                                out.write(v2 + "\n")
+                    # messages[].content
+                    msgs = obj.get("messages")
+                    if isinstance(msgs, list):
+                        for m in msgs:
+                            c = m.get("content")
+                            if isinstance(c, str) and c.strip():
+                                c2 = sanitize_text(strip_diag_markers(decode_hex_placeholders(c)))
+                                if c2:
+                                    out.write(c2 + "\n")
+            if progress_cb: progress_cb('ENV {"phase":"spm_merge","part":"jsonl","status":"done"}')
 
     prefix = out_dir / "tokenizer"
+    if progress_cb: progress_cb('ENV {"phase":"spm_train","status":"start"}')
     spm.SentencePieceTrainer.Train(
         input=str(tmp_corpus),
         model_prefix=str(prefix),
@@ -307,12 +385,12 @@ def train_sentencepiece_bpe(corpus_txt: Path, out_dir: Path, vocab_size: int, js
         pad_id=-1,
         byte_fallback=True,
         normalization_rule_name="identity",
-        add_dummy_prefix=False,               # не подставляем пробел в начале
-        hard_vocab_limit=False,               # позволяем добавить служебные/байтовые юниты
-        user_defined_symbols=[L3_BEGIN, L3_END, L3_S, L3_E, L3_EOT],  # Llama 3
+        add_dummy_prefix=False,
+        hard_vocab_limit=False,
+        user_defined_symbols=[L3_BEGIN, L3_END, L3_S, L3_E, L3_EOT],
     )
+    if progress_cb: progress_cb('ENV {"phase":"spm_train","status":"done"}')
 
-    # прибираем временный файл
     try:
         tmp_corpus.unlink()
     except Exception:
@@ -406,6 +484,78 @@ def load_sft_ids_llama3(sp: SentencePieceProcessor, jsonl_path: Path) -> list[in
 # ----------------------------
 # GGUF export (official)
 # ----------------------------
+class JsonlSFTIterableDataset(IterableDataset):
+    """Поточный датасет: читает .jsonl построчно, строит ChatML-представление и отдаёт куски блоками."""
+    def __init__(self, sp: SentencePieceProcessor, jsonl_path: Path, block_size: int):
+        super().__init__()
+        self.sp = sp
+        self.jsonl_path = jsonl_path
+        self.block = block_size
+
+    def _iter_ids(self):
+        sp = self.sp
+        with self.jsonl_path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    ex = json.loads(line)
+                except Exception:
+                    continue
+                # text
+                text = ex.get("text")
+                if text:
+                    text = _clean_field_for_sft(text)
+                    if not text:
+                        continue
+                    for tid in encode_spm(sp, text):
+                        yield tid
+                    continue
+                # user/assistant/messages
+                sys_ = ex.get("system", "")
+                usr = ex.get("prompt") or ex.get("user") or ex.get("input") or ex.get("question")
+                rsp = ex.get("response") or ex.get("assistant") or ex.get("answer")
+                if usr is None or rsp is None:
+                    msgs = ex.get("messages")
+                    if isinstance(msgs, list) and msgs:
+                        sys_msgs = [m.get("content","") for m in msgs if m.get("role")=="system"]
+                        usr_msgs = [m.get("content","") for m in msgs if m.get("role")=="user"]
+                        as_msgs  = [m.get("content","") for m in msgs if m.get("role")=="assistant"]
+                        if (not sys_) and sys_msgs: sys_ = sys_msgs[0]
+                        if usr is None and usr_msgs: usr = usr_msgs[-1]
+                        if rsp is None and as_msgs:  rsp = as_msgs[-1]
+                usr = _clean_field_for_sft(usr) if usr is not None else None
+                rsp = _clean_field_for_sft(rsp) if rsp is not None else None
+                if usr is None or rsp is None:
+                    continue
+                rendered = render_llama3(system=None, user=usr, assistant=rsp)
+                for tid in encode_spm(sp, rendered):
+                    yield tid
+
+    def __iter__(self):
+        buf = []
+        for tid in self._iter_ids():
+            buf.append(tid)
+            while len(buf) >= self.block + 1:
+                x = torch.tensor(buf[:self.block], dtype=torch.long)
+                y = torch.tensor(buf[1:self.block+1], dtype=torch.long)
+                yield x, y
+                del buf[:self.block]
+
+def build_loader_sft_streaming(sp: SentencePieceProcessor, jsonl_path: Path, block_size: int, batch_size: int, workers: int | None):
+    if workers is None:
+        workers = 0 if os.name == "nt" else 2
+    ds = JsonlSFTIterableDataset(sp, jsonl_path, block_size)
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=False,
+        num_workers=int(workers),
+        **({"persistent_workers": True, "prefetch_factor": 2} if workers > 0 else {})
+    )
+    return loader, None
 def _size_label(n: int) -> str:
     if n >= 1_000_000_000:
         v = n / 1e9; s = "B"
@@ -584,6 +734,7 @@ def run_epoch(model, opt, scaler, loader, device, progress_cb, epoch_i, epoch_T,
         scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt); scaler.update()
+
         global_step += 1
         pct = 100.0 * global_step / max(1, total_steps)
         step_time = time.time() - t0
@@ -667,17 +818,21 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     if run_dir.exists(): shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    spm_path = train_sentencepiece_bpe(corpus, run_dir, vocab_size, jsonl_for_vocab=jsonl_path)
+    spm_path = train_sentencepiece_bpe(corpus, run_dir, vocab_size, jsonl_for_vocab=jsonl_path, progress_cb=progress_cb)
+
     sp = SentencePieceProcessor(model_file=str(spm_path))
     n_sp = sp.vocab_size()
 
     # === Build training ids (LM / SFT / BOTH)
     lm_ids: list[int] = []
-    sft_ids: list[int] = []
+
+    # LM (Language Model) — читаем текстовый корпус
     if task in ("lm", "both"):
         lm_ids = load_lm_ids(sp, corpus)
-    if task in ("sft", "both") and jsonl_path:
-        sft_ids = load_sft_ids_llama3(sp, jsonl_path)
+        if progress_cb:
+            progress_cb(f"ENV {json.dumps({'ids_lm': len(lm_ids)})}")
+
+
 
     # === Model/Opt
     cfg = LlamaConfig(
@@ -692,33 +847,44 @@ def train_once(run_name: str, data_path: str, models_dir: str,
     # --- Минимальный pipeline-parallel на 2 GPU ---
     # Идея: часть ранних блоков кидаем на small_dev (например, 1 — GTX 1060 3GB),
     # остальное + финальные слои держим на big_dev (например, 0 — RTX 3070 Ti).
+    pipeline_enabled = False
     if device == "cuda" and torch.cuda.device_count() >= 2 and pipeline_split > 0:
         big = torch.device(f"cuda:{big_dev}")
         small = torch.device(f"cuda:{small_dev}")
 
-        # Сколько реально можно отдать на малую карту
+        # Сколько блоков отправлять на малую GPU (Pascal) — минимально 1
         split = max(1, min(pipeline_split, cfg.n_layer - 1))
 
-        # Embedding и первые split блоков — на small
+        # Перенос слоёв
         model.tok_emb.to(small)
         for i in range(split):
             model.blocks[i].to(small)
-
-        # Остальные блоки + norm + head — на big
         for i in range(split, cfg.n_layer):
             model.blocks[i].to(big)
         model.norm.to(big)
         model.lm_head.to(big)
 
+        # Сохраняем в конфиге индексы устройств (может пригодиться позже)
+        cfg.big_dev = big_dev
+        cfg.small_dev = small_dev
+
+        pipeline_enabled = True
         if progress_cb:
             progress_cb(
-                f"ENV {json.dumps({'pipeline': '2-gpu', 'split': split, 'big_dev': big_dev, 'small_dev': small_dev})}")
+                f'ENV {json.dumps({"pipeline": "2-gpu", "split": split, "big_dev": big_dev, "small_dev": small_dev})}')
     else:
-        # Одно устройство как раньше
+        # Одно устройство
         model = model.to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
-    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda" and amp))
+    amp_enabled = False
+    if device == "cuda" and amp:
+        if pipeline_enabled:
+            # AMP включаем только если у большой карты есть Tensor Cores
+            amp_enabled = _has_tensor_cores(big_dev)
+        else:
+            amp_enabled = _has_tensor_cores(0)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     total_params = sum(p.numel() for p in model.parameters())
     if progress_cb:
@@ -739,14 +905,145 @@ def train_once(run_name: str, data_path: str, models_dir: str,
         if progress_cb: progress_cb("PHASE:LM done")
 
     # ---- SFT phase
-    if task in ("sft", "both") and sft_ids:
+    def estimate_sft_steps_quick(sp: SentencePieceProcessor, jsonl_path: Path, block_size: int, batch_size: int,
+                                 max_bytes: int = 16 * 1024 * 1024, max_lines: int = 5000, progress_cb=None) -> int:
+        """
+        Быстрая оценка числа шагов на эпоху для стримингового JSONL:
+        - читаем ~первые 16 МБ или до 5000 строк
+        - честно токенизируем по тем же правилам, что в SFT (но без накопления в память)
+        - оцениваем общее число токенов пропорцией по размеру файла
+        - шаги = токены / (block_size * batch_size)
+
+        Возвращает целое количество шагов (>=1).
+        """
+        file_size = jsonl_path.stat().st_size
+        bytes_read = 0
+        sample_tokens = 0
+        lines_seen = 0
+
+        def _clean_field_for_sft_quick(s: str | None) -> str | None:
+            if s is None:
+                return None
+            s = decode_hex_placeholders(s)
+            s = strip_diag_markers(s)
+            s = sanitize_text(s)
+            return s
+
+        with jsonl_path.open("r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                bytes_read += len(raw.encode("utf-8", "ignore"))
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    ex = json.loads(line)
+                except Exception:
+                    continue
+
+                # text
+                text = ex.get("text")
+                if text:
+                    text = _clean_field_for_sft_quick(text)
+                    if text:
+                        sample_tokens += len(encode_spm(sp, text))
+                        lines_seen += 1
+                else:
+                    # user/assistant/messages
+                    sys_ = ex.get("system", "")
+                    usr = ex.get("prompt") or ex.get("user") or ex.get("input") or ex.get("question")
+                    rsp = ex.get("response") or ex.get("assistant") or ex.get("answer")
+                    if usr is None or rsp is None:
+                        msgs = ex.get("messages")
+                        if isinstance(msgs, list) and msgs:
+                            sys_msgs = [m.get("content", "") for m in msgs if m.get("role") == "system"]
+                            usr_msgs = [m.get("content", "") for m in msgs if m.get("role") == "user"]
+                            as_msgs = [m.get("content", "") for m in msgs if m.get("role") == "assistant"]
+                            if (not sys_) and sys_msgs: sys_ = sys_msgs[0]
+                            if usr is None and usr_msgs: usr = usr_msgs[-1]
+                            if rsp is None and as_msgs:  rsp = as_msgs[-1]
+                    usr = _clean_field_for_sft_quick(usr) if usr is not None else None
+                    rsp = _clean_field_for_sft_quick(rsp) if rsp is not None else None
+                    if usr is not None and rsp is not None:
+                        rendered = render_llama3(system=None, user=usr, assistant=rsp)
+                        sample_tokens += len(encode_spm(sp, rendered))
+                        lines_seen += 1
+
+                if bytes_read >= max_bytes or lines_seen >= max_lines:
+                    break
+
+        # защита от деления на 0
+        if bytes_read == 0 or sample_tokens == 0:
+            return 1
+
+        # пропорция токенов на весь файл (по байтам)
+        total_tokens_est = int(sample_tokens * (file_size / max(1, bytes_read)))
+        steps_est = max(1, total_tokens_est // max(1, block_size * batch_size))
+
+        if progress_cb:
+            payload = {
+                "sft_steps_est": steps_est,
+                "sample_bytes": bytes_read,
+                "file_bytes": file_size,
+                "sample_lines": lines_seen,
+                "sample_tokens": sample_tokens
+            }
+            progress_cb(f"ENV {json.dumps(payload)}")
+
+        return steps_est
+
+    # ---- SFT phase
+    if task in ("sft", "both") and jsonl_path and Path(jsonl_path).exists():
         if progress_cb: progress_cb(f"PHASE:SFT start (epochs={epochs_sft or 1})")
         epT = (epochs_sft if epochs_sft and epochs_sft > 0 else 1)
-        train_loader_sft, _ = build_loader(sft_ids, block_size, batch_size, workers)
-        total_steps = max(1, epT * len(train_loader_sft))
-        for ep in range(1, epT + 1):
-            global_step = run_epoch(model, opt, scaler, train_loader_sft, device, progress_cb, ep, epT, global_step,
-                                    total_steps)
+
+        # Быстрая оценка количества шагов на эпоху
+        steps_per_epoch_est = estimate_sft_steps_quick(sp, jsonl_path, block_size, batch_size, progress_cb=progress_cb)
+
+        # Автоподбор batch size при OOM — оставляем как был (если у тебя он уже есть, используем его),
+        # иначе — простой прямой цикл.
+        bs_try = int(batch_size)
+        while True:
+            try:
+                train_loader_sft, _ = build_loader_sft_streaming(sp, jsonl_path, block_size, bs_try, workers)
+                for ep in range(1, epT + 1):
+                    model.train()
+                    pbar = tqdm(train_loader_sft, desc=f"epoch {ep}/{epT}")
+                    steps_done = 0
+                    t_epoch0 = time.time()
+                    for step, (xb, yb) in enumerate(pbar, 1):
+                        t0 = time.time()
+                        opt.zero_grad(set_to_none=True)
+                        with torch.amp.autocast("cuda", enabled=scaler.is_enabled()):
+                            _, loss = model(xb, yb)
+                        scaler.scale(loss).backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(opt);
+                        scaler.update()
+                        steps_done += 1
+
+                        # процент/ETA по оценке
+                        pct = 100.0 * min(steps_done, steps_per_epoch_est) / max(1, steps_per_epoch_est)
+                        elapsed = time.time() - t_epoch0
+                        it_s = (elapsed / max(1, steps_done))
+                        remain_s = max(0.0, (steps_per_epoch_est - steps_done) * it_s)
+
+                        if progress_cb:
+                            progress_cb(
+                                f"Progress:  {pct:.2f}% | epoch {ep}/{epT} | step {steps_done}/{steps_per_epoch_est} | loss {loss.item():.4f} | s_it {time.time() - t0:.2f}s/it | elapsed {elapsed / 60:.1f}m | ETA {remain_s / 60:.1f}m"
+                            )
+                break  # успех — выходим из while
+            except torch.cuda.OutOfMemoryError:
+                if 'torch' in globals() and torch.cuda.is_available():
+                    torch.cuda.synchronize();
+                    torch.cuda.empty_cache()
+                new_bs = max(1, bs_try // 2)
+                if new_bs == bs_try:
+                    raise
+                bs_try = new_bs
+                if progress_cb:
+                    progress_cb(f'ENV {json.dumps({"auto_batch": bs_try, "reason": "oom"})}')
+                continue
+
         if progress_cb: progress_cb("PHASE:SFT done")
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -806,7 +1103,7 @@ def cli_main():
     ap.add_argument("--workers", type=int, default=None, help="DataLoader workers (override)")
     ap.add_argument("--dtype", type=str, default="float16", choices=["float16", "float32", "bfloat16"])
     ap.add_argument("--quant", type=str, default=None, help="e.g. Q3_K_L, Q4_K_M, Q5_K_S, Q8_0, IQ4_NL ...")
-    ap.add_argument("--quant-bin", type_str := str, default=None, help="path to llama-quantize if not in PATH")
+    ap.add_argument("--quant-bin", type=str, default=None, help="path to llama-quantize if not in PATH")
     ap.add_argument("--no-keep-fp16", action="store_true", help="remove original FP16/FP32 after quantization")
     args = ap.parse_args()
 
